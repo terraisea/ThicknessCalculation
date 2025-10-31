@@ -1,15 +1,19 @@
 from rasterio import open
 import geopandas as gpd
 from shapely.geometry import Polygon
+from pathlib import Path
 import numpy as np
 
-with open("./database/zhangzhongjing1.tif") as dataset:
+with open("E:\code\geo_processing\database\zhangzhongjing1.tif") as dataset:
     width = dataset.width
     height = dataset.height
 
 # 读取空格分隔的 TXT 文件
-data = np.loadtxt("database/zhangzhongjing1020.txt")  # 默认按空格分割
+data = np.loadtxt("E:\code\geo_processing\database\zhangzhongjing1020.txt")  # 默认按空格分割
 rows = len(data)
+
+results = []
+output_folder = f"E:\code\geo_processing/database/UnifiedProject2"  # 建立到文件夹即可
 
 for i in range(rows):
     x_center = data[i,1]
@@ -32,7 +36,20 @@ for i in range(rows):
     X_RB=x_center_coords+width_coords
     Y_RB=y_center_coords+height_coords
 
+    #外扩像素,以得到环境平缓高程
+    Pixel = 10
+    XE_LT = X_LT-Pixel ; YE_LT = Y_LT-Pixel
+    XE_LB = X_LB+Pixel ; YE_LB = Y_LB-Pixel
+    XE_RT = X_RT-Pixel ; YE_RT = Y_RT+Pixel
+    XE_RB = X_RB+Pixel ; YE_RB = Y_RB+Pixel
+    # 保存为一行
+    results.append([XE_LT, YE_LT, XE_LB, YE_LB, XE_RT, YE_RT, XE_RB, YE_RB])
+    Path(output_folder).mkdir(parents=True, exist_ok=True)  # ✅ 如果文件夹不存在则自动创建
+    output_path = f"{output_folder}/expanded_coordinates.txt"
+    np.savetxt(output_path, results, fmt="%.6f", delimiter="\t",
+               header="XE_LT\tYE_LT\tXE_LB\tYE_LB\tXE_RT\tYE_RT\tXE_RB\tYE_RB", comments='')
 
+    #dataset.transform可将像素坐标转换为同tif同坐标系的下的经纬度
     xlt, ylt = dataset.transform * (X_LT, Y_LT)
     xlb, ylb = dataset.transform * (X_LB, Y_LB)
     xrt, yrt = dataset.transform * (X_RT, Y_RT)
@@ -53,8 +70,8 @@ for i in range(rows):
     filename = str(data[i][1])
 
     # 构造完整路径
-    filepath = f"./database/UnifiedProject/{filename}.shp"
-
-    gdf_poly.to_file(filepath, driver="ESRI Shapefile")
+    Path(output_folder).mkdir(parents=True, exist_ok=True)  # ✅ 如果文件夹不存在则自动创建
+    output_filepath = f"{output_folder}/{filename}.shp"
+    gdf_poly.to_file(output_filepath, driver="ESRI Shapefile")
 
     print(f"Saved {filename}")
