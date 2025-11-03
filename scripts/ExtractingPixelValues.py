@@ -1,101 +1,166 @@
+import argparse
 import rasterio
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-#路径设置#
-base_dir = Path(r"E:\code\geo_processing\database\testdata\mask")
-dem_dir = base_dir / "DEM"
-cf_dir = base_dir / "CF"
-output_dir = base_dir / "show"
-output_dir.mkdir(exist_ok=True, parents=True)
-#常数设置
-# 定义一个极小阈值，例如 -3e10
-threshold = -3e10
 
-# 1. 打开 DEM
-for dem_file in dem_dir.glob("*.tif"):
-    filename = dem_file.stem  # 不带后缀的文件名，比如 "0.61232"
-    cf_file = cf_dir / f"{filename}.tif"  # 查找 CF 下的同名文件
+def process_files(mode):
+    threshold = -3e10  # 固定阈值，用于后面过滤rasterio进行掩膜得到的tif的nodata区域
 
-    # ========== 打开 DEM ==========
-    with rasterio.open(dem_file) as src:
-        img = src.read().astype(float)
-        img[img < threshold] = np.nan  # 将 nodata 转为 nan
-    row_median = img.shape[2] // 2
-    col_median = img.shape[1] // 2
-    row_values = img[0, col_median - 1, :]
-    col_values = img[0, :, row_median - 1]
+    # ========== 路径设置（保持原样） ==========
+    base_dir = Path(r"E:\code\geo_processing\database\testdata\mask")
+    #BatchProcessingMask.py运行后得到的文件夹，⭐注意:路径只到文件夹
+    dem_dir = base_dir / "DEMargparse"  #读取文件夹下的DEM
+    cf_dir = base_dir / "CF"    #读取文件夹下的DEM
+    output_dir = base_dir / "show2"  #输出文件的路径，⭐注意:路径只到文件夹
+    output_dir.mkdir(exist_ok=True, parents=True)
 
-    x1 = np.arange(len(col_values))
-    y1 = col_values
-    x2 = np.arange(len(row_values))
-    y2 = row_values
+    if mode in ["dem", "cf"]:
+        current_dir = dem_dir if mode == "dem" else cf_dir
+        color_col = "blue" if mode == "dem" else "green"
+        color_row = "blue" if mode == "dem" else "green"
 
-    # ========== 打开 CF ==========
-    with rasterio.open(cf_file) as src2:
-        img2 = src2.read().astype(float)
-        img2[img2 < threshold] = np.nan
-    row_median2 = img2.shape[2] // 2
-    col_median2 = img2.shape[1] // 2
-    row_values2 = img2[0, col_median2 - 1, :]
-    col_values2 = img2[0, :, row_median2 - 1]
+        for file in current_dir.glob("*.tif"):
+            filename = file.stem
+            print(f"▶ 正在处理: {filename} ({mode.upper()})")
 
-    x3 = np.arange(len(col_values2))
-    y3 = col_values2
-    x4 = np.arange(len(row_values2))
-    y4 = row_values2
+            with rasterio.open(file) as src:
+                img = src.read().astype(float)
+                img[img < threshold] = np.nan
 
-    # ========== 绘图 ==========
-    plt.figure(figsize=(10, 8))
-    plt.subplot(2, 2, 1)
-    plt.plot(x1, y1, label='DEM Col', color='blue', linewidth=2)
-    plt.title("ColCalculateThickness")
-    plt.xlabel("X axis")
-    plt.ylabel("Y axis")
-    plt.legend()
-    plt.grid(True)
+            row_mid = img.shape[2] // 2
+            col_mid = img.shape[1] // 2
+            row_values = img[0, col_mid - 1, :]
+            col_values = img[0, :, row_mid - 1]
 
-    plt.subplot(2, 2, 2)
-    plt.plot(x2, y2, label='DEM Row', color='blue', linewidth=2)
-    plt.title("RowCalculateThickness")
-    plt.xlabel("X axis")
-    plt.ylabel("Y axis")
-    plt.legend()
-    plt.grid(True)
+            x1 = np.arange(len(col_values))
+            y1 = col_values
+            x2 = np.arange(len(row_values))
+            y2 = row_values
 
-    plt.subplot(2, 2, 3)
-    plt.plot(x3, y3, label='CF Col', color='green', linewidth=2)
-    plt.title("ColCF")
-    plt.xlabel("X axis")
-    plt.ylabel("Y axis")
-    plt.legend()
-    plt.grid(True)
+            # 绘图 2x1
+            plt.figure(figsize=(8, 6))
+            plt.subplot(2, 1, 1)
+            plt.plot(x1, y1, label=f"{mode.upper()} Col", color=color_col, linewidth=2)
+            plt.title(f"{mode.upper()} Col Profile")
+            plt.xlabel("X axis")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True)
 
-    plt.subplot(2, 2, 4)
-    plt.plot(x4, y4, label='CF Row', color='green', linewidth=2)
-    plt.title("RowCF")
-    plt.xlabel("X axis")
-    plt.ylabel("Y axis")
-    plt.legend()
-    plt.grid(True)
+            plt.subplot(2, 1, 2)
+            plt.plot(x2, y2, label=f"{mode.upper()} Row", color=color_row, linewidth=2)
+            plt.title(f"{mode.upper()} Row Profile")
+            plt.xlabel("X axis")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True)
 
-    plt.tight_layout(pad=2.0)
+            plt.tight_layout(pad=2.0)
+            plt.savefig(output_dir / f"{filename}_{mode}_show.png", dpi=200)
+            plt.close()
 
-    # 保存图像
-    out_img = output_dir / f"{filename}_show.png"
-    plt.savefig(out_img, dpi=200)
-    plt.close()
+            # 保存 CSV
+            np.savetxt(output_dir / f"{filename}_{mode}_Col.csv",
+                       np.column_stack((x1, y1)), delimiter=",", header="x,y", comments='')
+            np.savetxt(output_dir / f"{filename}_{mode}_Row.csv",
+                       np.column_stack((x2, y2)), delimiter=",", header="x,y", comments='')
 
-    # ========== 保存数据 ==========
-    np.savetxt(output_dir / f"{filename}_ColCalculateThickness.csv",
-               np.column_stack((x1, y1)), delimiter=",", header="x,y", comments='')
-    np.savetxt(output_dir / f"{filename}_RowCalculateThickness.csv",
-               np.column_stack((x2, y2)), delimiter=",", header="x,y", comments='')
-    np.savetxt(output_dir / f"{filename}_ColCF.csv",
-               np.column_stack((x3, y3)), delimiter=",", header="x,y", comments='')
-    np.savetxt(output_dir / f"{filename}_RowCF.csv",
-               np.column_stack((x4, y4)), delimiter=",", header="x,y", comments='')
-    print(filename,"已完成")
+            print(f"✅ {filename} 已完成 ({mode.upper()})")
 
-print("✅ 所有文件处理完成！结果已保存到:", output_dir)
+    elif mode == "all":
+        dem_files = list(dem_dir.glob("*.tif"))
+        for dem_file in dem_files:
+            filename = dem_file.stem
+            cf_file = cf_dir / f"{filename}.tif"
+            if not cf_file.exists():
+                print(f"⚠ CF 文件不存在: {cf_file}, 跳过")
+                continue
+            print(f"▶ 正在处理: {filename} (ALL)")
+
+            # DEM
+            with rasterio.open(dem_file) as src:
+                dem_img = src.read().astype(float)
+                dem_img[dem_img < threshold] = np.nan
+
+            dem_row_mid = dem_img.shape[2] // 2
+            dem_col_mid = dem_img.shape[1] // 2
+            dem_row_values = dem_img[0, dem_col_mid - 1, :]
+            dem_col_values = dem_img[0, :, dem_row_mid - 1]
+
+            x1 = np.arange(len(dem_col_values))
+            y1 = dem_col_values
+            x2 = np.arange(len(dem_row_values))
+            y2 = dem_row_values
+
+            # CF
+            with rasterio.open(cf_file) as src2:
+                cf_img = src2.read().astype(float)
+                cf_img[cf_img < threshold] = np.nan
+
+            cf_row_mid = cf_img.shape[2] // 2
+            cf_col_mid = cf_img.shape[1] // 2
+            cf_row_values = cf_img[0, cf_col_mid - 1, :]
+            cf_col_values = cf_img[0, :, cf_row_mid - 1]
+
+            x3 = np.arange(len(cf_col_values))
+            y3 = cf_col_values
+            x4 = np.arange(len(cf_row_values))
+            y4 = cf_row_values
+
+            # 绘图 2x2
+            plt.figure(figsize=(10, 8))
+            plt.subplot(2, 2, 1)
+            plt.plot(x1, y1, label="DEM Col", color="blue", linewidth=2)
+            plt.title("DEM Col Profile")
+            plt.xlabel("X axis")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True)
+
+            plt.subplot(2, 2, 2)
+            plt.plot(x2, y2, label="DEM Row", color="blue", linewidth=2)
+            plt.title("DEM Row Profile")
+            plt.xlabel("X axis")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True)
+
+            plt.subplot(2, 2, 3)
+            plt.plot(x3, y3, label="CF Col", color="green", linewidth=2)
+            plt.title("CF Col Profile")
+            plt.xlabel("X axis")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True)
+
+            plt.subplot(2, 2, 4)
+            plt.plot(x4, y4, label="CF Row", color="green", linewidth=2)
+            plt.title("CF Row Profile")
+            plt.xlabel("X axis")
+            plt.ylabel("Value")
+            plt.legend()
+            plt.grid(True)
+
+            plt.tight_layout(pad=2.0)
+            plt.savefig(output_dir / f"{filename}_all_show.png", dpi=200)
+            plt.close()
+
+            # 保存 CSV
+            np.savetxt(output_dir / f"{filename}_DEM_Col.csv", np.column_stack((x1, y1)), delimiter=",", header="x,y", comments='')
+            np.savetxt(output_dir / f"{filename}_DEM_Row.csv", np.column_stack((x2, y2)), delimiter=",", header="x,y", comments='')
+            np.savetxt(output_dir / f"{filename}_CF_Col.csv", np.column_stack((x3, y3)), delimiter=",", header="x,y", comments='')
+            np.savetxt(output_dir / f"{filename}_CF_Row.csv", np.column_stack((x4, y4)), delimiter=",", header="x,y", comments='')
+
+            print(f"✅ {filename} 已完成 (ALL)")
+
+    print(f"🎯 所有文件处理完成！结果已保存到: {output_dir}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="批量处理 DEM / CF 文件，输出剖面图与CSV")
+    parser.add_argument("--mode", type=str, choices=["dem", "cf", "all"], default="all",
+                        help="选择处理模式: dem / cf / all")
+    args = parser.parse_args()
+    process_files(mode=args.mode)

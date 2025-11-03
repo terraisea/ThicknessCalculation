@@ -1,69 +1,83 @@
+import argparse
 import rasterio
 from rasterio.mask import mask
 import geopandas as gpd
 from shapely.geometry import mapping
 from pathlib import Path
 
-# 读取 shapefile
-folder = Path(r"E:\code\geo_processing\database\UnifiedProject")#路径到文件夹
-# 获取所有 .shp 文件
-shp_list = list(folder.glob("*.shp"))
-# 读取 shapefile
-shp_path = shp_list
+def mask_raster(shp_list, tif_path, output_folder, label):
+    """对一组 shapefile 执行掩膜"""
+    for shp in shp_list:
+        gdf = gpd.read_file(shp)
+        geoms = [mapping(geom) for geom in gdf.geometry]
 
-# 读取栅格
-tif_path_DEM = r"E:\code\geo_processing\database\DEM\ZhangDEM1.tif"
-tif_path_CF = r"E:\code\geo_processing\database\DEM\ZhangCF.tif"
+        with rasterio.open(tif_path) as src:
+            out_image, out_transform = mask(src, geoms, crop=True)
+            out_meta = src.meta.copy()
 
-for shp in shp_path:
-    gdf = gpd.read_file(shp)
-    geoms = [mapping(geom) for geom in gdf.geometry] #单个与多个不冲突
+        out_meta.update({
+            "driver": "GTiff",
+            "height": out_image.shape[1],
+            "width": out_image.shape[2],
+            "transform": out_transform
+        })
 
-    #DEM
-    # 打开 tif 并掩膜
-    with rasterio.open(tif_path_DEM) as src:
-        out_image, out_transform = mask(src, geoms, crop=True)
-        out_meta = src.meta.copy()
+        shp_name = shp.stem
+        Path(output_folder).mkdir(parents=True, exist_ok=True)
+        output_filepath = f"{output_folder}/{shp_name}.tif"
 
-    # 更新元数据并写出结果
-    out_meta.update({
-        "driver": "GTiff",
-        "height": out_image.shape[1],
-        "width": out_image.shape[2],
-        "transform": out_transform
-    })
+        with rasterio.open(output_filepath, "w", **out_meta) as dest:
+            dest.write(out_image)
 
-    shp_name = shp.stem  # 只获取文件名（不含路径、不含后缀）
-    output_folder = r"E:\code\geo_processing\database\testdata\mask\DEM"
-    Path(output_folder).mkdir(parents=True, exist_ok=True)# ✅ 如果文件夹不存在则自动创建
-    output_filepath = f"{output_folder}/{shp_name}.tif"
+        print(f"{label} 掩膜完成，输出文件：{output_filepath}")
 
-    with rasterio.open(output_filepath, "w", **out_meta) as dest:
-        dest.write(out_image)
 
-    print("DEM掩膜完成，输出文件：", output_filepath)
+def main(mode):
+    folder = Path(r"E:\code\geo_processing\database\UnifiedProject")   #shp文件的文件夹，⭐注意:路径只到文件夹
+    shp_list = list(folder.glob("*.shp"))  #可以自动读取文件夹内的shp
 
-    # cf
-    # 打开 tif 并掩膜
-    with rasterio.open(tif_path_CF) as src:
-        out_image, out_transform = mask(src, geoms, crop=True)
-        out_meta = src.meta.copy()
+    tif_path_DEM = r"E:\code\geo_processing\database\DEM\ZhangDEM1.tif" #被掩膜的DEM数据的路径，⭐需要写到该文件的全部路径
+    tif_path_CF = r"E:\code\geo_processing\database\DEM\ZhangCF.tif"    #被掩膜的CF数据的路径，⭐需要写到该文件的全部路径
 
-    # 更新元数据并写出结果
-    out_meta.update({
-        "driver": "GTiff",
-        "height": out_image.shape[1],
-        "width": out_image.shape[2],
-        "transform": out_transform
-    })
+    if mode == "a":
+        # 仅执行 DEM 掩膜
+        mask_raster(
+            shp_list,
+            tif_path_DEM,
+            r"E:\code\geo_processing\database\testdata\mask\DEMargparse",#掩膜得到的DEM数据的文件夹路径，⭐注意:路径只到文件夹
+            "DEM"
+        )
 
-    shp_name = shp.stem  # 只获取文件名（不含路径、不含后缀）
-    output_folder = r"E:\code\geo_processing\database\testdata\mask\CF"
-    Path(output_folder).mkdir(parents=True, exist_ok=True)  # ✅ 如果文件夹不存在则自动创建
-    output_filepath = f"{output_folder}/{shp_name}.tif"
+    elif mode == "b":
+        # 仅执行 CF 掩膜
+        mask_raster(
+            shp_list,
+            tif_path_CF,
+            r"E:\code\geo_processing\database\testdata\mask\CFargparse",#掩膜得到的CF数据的文件夹路径，⭐注意:路径只到文件夹
+            "CF"
+        )
 
-    with rasterio.open(output_filepath, "w", **out_meta) as dest:
-        dest.write(out_image)
+    elif mode == "all":
+        # 两个都执行
+        mask_raster(
+            shp_list,
+            tif_path_DEM,
+            r"E:\code\geo_processing\database\testdata\mask\DEMargparse",#掩膜得到的DEM数据的文件夹路径，⭐注意:路径只到文件夹
+            "DEM"
+        )
+        mask_raster(
+            shp_list,
+            tif_path_CF,
+            r"E:\code\geo_processing\database\testdata\mask\CFargparse",#掩膜得到的CF数据的文件夹路径，⭐注意:路径只到文件夹
+            "CF"
+        )
+    else:
+        print("未知任务，请使用 --mode a / b / all")
 
-    print("CF掩膜完成，输出文件：", output_filepath)
 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Shapefile 掩膜工具")
+    parser.add_argument("--mode", choices=["a", "b", "all"], required=True,
+                        help="选择掩膜任务：a=DEM，b=CF，all=全部")
+    args = parser.parse_args()
+    main(args.mode)

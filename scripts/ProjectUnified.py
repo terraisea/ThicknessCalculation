@@ -47,7 +47,7 @@ for i in range(rows):
     polygon = Polygon(poly_coords)
 
     # 外扩
-    Pixel = 10
+    Pixel = 10   #由于DEM与WAC分辨率相差0.4224倍，此处应该需要考虑一下。wac ✖ 0.4224 = DEM
     XE_LT = X_LT - Pixel; YE_LT = Y_LT - Pixel
     XE_LB = X_LB + Pixel; YE_LB = Y_LB - Pixel
     XE_RT = X_RT - Pixel; YE_RT = Y_RT + Pixel
