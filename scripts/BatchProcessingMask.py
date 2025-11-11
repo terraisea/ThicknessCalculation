@@ -33,18 +33,18 @@ def mask_raster(shp_list, tif_path, output_folder, label):
 
 
 def main(mode):
-    folder = Path(r"E:\code\geo_processing\database\UnifiedProject")   #shp文件的文件夹，⭐注意:路径只到文件夹
+    folder = Path(r"E:\code\geo_processing\database\marius\shp")   #shp文件的文件夹，⭐注意:路径只到文件夹
     shp_list = list(folder.glob("*.shp"))  #可以自动读取文件夹内的shp
 
-    tif_path_DEM = r"E:\code\geo_processing\database\DEM\ZhangDEM1.tif" #被掩膜的DEM数据的路径，⭐需要写到该文件的全部路径
-    tif_path_CF = r"E:\code\geo_processing\database\DEM\ZhangCF.tif"    #被掩膜的CF数据的路径，⭐需要写到该文件的全部路径
+    tif_path_DEM = r"E:\code\geo_processing\database\marius\dem.tif" #被掩膜的DEM数据的路径，⭐需要写到该文件的全部路径
+    tif_path_CF = r"E:\code\geo_processing\database\marius\cf.tif"    #被掩膜的CF数据的路径，⭐需要写到该文件的全部路径
 
     if mode == "a":
         # 仅执行 DEM 掩膜
         mask_raster(
             shp_list,
             tif_path_DEM,
-            r"E:\code\geo_processing\database\testdata\mask\DEMargparse",#掩膜得到的DEM数据的文件夹路径，⭐注意:路径只到文件夹
+            r"E:\code\geo_processing\database\marius\dem",#掩膜得到的DEM数据的文件夹路径，⭐注意:路径只到文件夹
             "DEM"
         )
 
@@ -53,7 +53,7 @@ def main(mode):
         mask_raster(
             shp_list,
             tif_path_CF,
-            r"E:\code\geo_processing\database\testdata\mask\CFargparse",#掩膜得到的CF数据的文件夹路径，⭐注意:路径只到文件夹
+            r"E:\code\geo_processing\database\marius\CF",#掩膜得到的CF数据的文件夹路径，⭐注意:路径只到文件夹
             "CF"
         )
 
@@ -62,13 +62,13 @@ def main(mode):
         mask_raster(
             shp_list,
             tif_path_DEM,
-            r"E:\code\geo_processing\database\testdata\mask\DEMargparse",#掩膜得到的DEM数据的文件夹路径，⭐注意:路径只到文件夹
+            r"E:\code\geo_processing\database\marius\dem",#掩膜得到的DEM数据的文件夹路径，⭐注意:路径只到文件夹
             "DEM"
         )
         mask_raster(
             shp_list,
             tif_path_CF,
-            r"E:\code\geo_processing\database\testdata\mask\CFargparse",#掩膜得到的CF数据的文件夹路径，⭐注意:路径只到文件夹
+            r"E:\code\geo_processing\database\marius\cf",#掩膜得到的CF数据的文件夹路径，⭐注意:路径只到文件夹
             "CF"
         )
     else:
