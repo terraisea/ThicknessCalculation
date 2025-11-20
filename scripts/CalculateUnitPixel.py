@@ -23,18 +23,18 @@ def extract_elev_by_slope(slope_vals, slope_idxs, y):
 
     # 过滤 NaN 的坡度（若坡度里有 NaN）
     valid = ~np.isnan(slope_vals)   # 标记非NaN的有效坡度值
-    cond = (slope_vals < threshold) & valid# 同时满足:坡度值 < 3度、坡度值不是NaN
-    idxs = np.where(cond)[0]    # 在 slope_vals 中的索引位置（不是 y 的索引）
+    cond = (slope_vals < threshold) & valid  # 同时满足:坡度值 < 3度、坡度值不是NaN
+    idxs = np.where(cond)[0]        # 在 slope_vals 中的索引位置（不是 y 的索引）
 
     if idxs.size == 0:
         return np.array([])
 
     # 找到坡度数组中的索引，不是高程数组的索引
     first_pos = idxs[0]
-    last_pos = idxs[-1]
+    last_pos  = idxs[-1]
     # 对应到 y 数组上的真实索引
     start_idx = int(slope_idxs[first_pos])
-    end_idx = int(slope_idxs[last_pos])
+    end_idx   = int(slope_idxs[last_pos])
 
     if start_idx <= end_idx:
         return y[start_idx:end_idx + 1]
@@ -111,38 +111,41 @@ def calc_mean_elevation(csv_path, cf_path=None):
         right_slope_idxs.append(i)
 
     # ---------- 提取平缓区 ----------
-    # 分别计算左右平缓区平均高程
-    left_flat_y = extract_elev_by_slope(left_slope_vals, left_slope_idxs, x)
+    left_flat_y  = extract_elev_by_slope(left_slope_vals, left_slope_idxs, x)
     right_flat_y = extract_elev_by_slope(right_slope_vals, right_slope_idxs, x)
 
-    mean_left = np.nanmean(left_flat_y) if len(left_flat_y) > 0 else np.nan
+    mean_left  = np.nanmean(left_flat_y)  if len(left_flat_y) > 0 else np.nan
     mean_right = np.nanmean(right_flat_y) if len(right_flat_y) > 0 else np.nan
 
     # ---------- 计算 h1 ----------
-    h1_left = left_peak_val - mean_left if not np.isnan(mean_left) else np.nan
-    h1_right = right_peak_val - mean_right if not np.isnan(mean_right) else np.nan
+    h1_left  = left_peak_val  - mean_left   if not np.isnan(mean_left)  else np.nan
+    h1_right = right_peak_val - mean_right  if not np.isnan(mean_right) else np.nan
 
     # ---------- 计算 h2 ----------
-    # h2 = 峰顶高程 - cf值<8.2处的高程（按左右分组，从最外侧向中心寻找）
+    # 新要求：
+    #  - 完全不检查 x 与 cf 的长度关系
+    #  - 从最高点开始向内（左峰→右走；右峰→左走）
+    #  - 第一处 cf < 8.2 即使用
     h2_left = np.nan
     h2_right = np.nan
-    if cf_path and Path(cf_path).exists():
-        cf_data = pd.read_csv(cf_path)
-        cf_vals = cf_data["value"].to_numpy()
-        n_cf = len(cf_vals)
-        mid_cf = n_cf // 2
 
-        for i in range(0, mid_cf + 1):
-            if cf_vals[i] < 8.2:
-                h2_left = left_peak_val - x[i]
+    if cf_path and Path(cf_path).exists():
+        cf_vals = pd.read_csv(cf_path)["value"].to_numpy()
+
+        # 左边：从左峰顶往右
+        for idx in range(left_peak_idx, len(cf_vals)):
+            if cf_vals[idx] < 8.2:
+                h2_left = left_peak_val - x[idx]
                 break
-        for i in range(n_cf - 1, mid_cf - 1, -1):
-            if cf_vals[i] < 8.2:
-                h2_right = right_peak_val - x[i]
+
+        # 右边：从右峰顶往左
+        for idx in range(right_peak_idx, -1, -1):
+            if cf_vals[idx] < 8.2:
+                h2_right = right_peak_val - x[idx]
                 break
 
     # ---------- 计算最终 h ----------
-    h_left = 0.8 * (h2_left - 0.2 * h1_left) if not np.isnan(h1_left) and not np.isnan(h2_left) else np.nan
+    h_left  = 0.8 * (h2_left  - 0.2 * h1_left)  if not np.isnan(h1_left)  and not np.isnan(h2_left)  else np.nan
     h_right = 0.8 * (h2_right - 0.2 * h1_right) if not np.isnan(h1_right) and not np.isnan(h2_right) else np.nan
 
     return {
@@ -221,7 +224,7 @@ for prefix in prefixes:
 # ---------- 合并生成一个 SHP ----------
 if all_records:
     gdf = gpd.GeoDataFrame(all_records, crs=crs_wkt)
-    out_shp = output_dir / "all_prefixes_points.shp"
+    out_shp = output_dir / "all_prefixes_points1120.shp"
     gdf.to_file(out_shp)
     print(f"✅ SHP 已生成: {out_shp}")
 else:
