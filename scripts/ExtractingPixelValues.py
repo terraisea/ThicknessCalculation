@@ -11,7 +11,7 @@ def process_files(mode):
     threshold = -3e10  # 固定阈值，用于后面过滤rasterio进行掩膜得到的tif的nodata区域
 
     # ========== 路径设置（保持原样） ==========
-    base_dir = Path(r"E:\code\geo_processing\database\marius")
+    base_dir = Path(r"E:\code\geo_processing\database\marius\marius\YOLO")
     #BatchProcessingMask.py运行后得到的文件夹，⭐注意:路径只到文件夹
     dem_dir = base_dir / "dem"  #读取文件夹下的DEM
     cf_dir = base_dir / "cf"    #读取文件夹下的DEM

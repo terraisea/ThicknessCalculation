@@ -4,15 +4,15 @@ from shapely.geometry import Polygon
 from pathlib import Path
 import numpy as np
 
-with open(r"E:\code\geo_processing\database\marius\mar2.tif") as dataset:
+with open(r"E:\code\geo_processing\database\marius\CE5\ce5.tif") as dataset:
     width = dataset.width
     height = dataset.height
 
-data = np.loadtxt(r"E:\code\geo_processing\database\marius\marius.txt") #YOLO生成的坐标txt
+data = np.loadtxt(r"E:\code\geo_processing\database\marius\CE5\cepredictepoch150\kaggle\working\runs\detect\predict4\labels\ce5.txt") #YOLO生成的坐标txt
 rows = len(data)
 
 results = []
-output_folder = r"E:\code\geo_processing\database\marius\shp"#输出文件夹路径，注意是文件夹
+output_folder = r"E:\code\geo_processing\database\ce5"#输出文件夹路径，注意是文件夹
 
 # ✅ 同时创建 ExRegion 子文件夹
 Path(output_folder).mkdir(parents=True, exist_ok=True)

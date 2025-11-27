@@ -44,7 +44,7 @@ def extract_elev_by_slope(slope_vals, slope_idxs, y):
 # ===============================================
 #  读取 DEM 元信息
 # ===============================================
-with rasterio.open(r"E:\code\geo_processing\database\marius\dem.tif") as src:
+with rasterio.open(r"E:\code\geo_processing\database\marius\marius\demmar.tif") as src:  #⭐读取dem，通过位置计算坡度，防止纬度升高出现差错
     transform = src.transform
     xres = abs(transform.a) # 每像元宽度
     yres = abs(transform.e) # 每像元高度
@@ -158,28 +158,38 @@ def calc_mean_elevation(csv_path, cf_path=None):
     }
 
 # ===============================================
-#  批处理部分
+#  批处理部分（根据合并后的 shp 的 name 字段来处理）
 # ===============================================
-shp_dir = Path(r"E:\code\geo_processing\database\marius\shp")
-base_dir = Path(r"E:\code\geo_processing\database\marius\show")
-output_dir = Path(r"E:\code\geo_processing\database\marius\thickness")
+project_dir = Path(r"E:\code\geo_processing\database\marius\marius\YOLO")
+
+shp_file = project_dir / "YOLOCarters"     # ⭐ 含有坑信息shp的名字
+base_dir = project_dir / "show"                  # 导入 CSV 的路径
+output_dir = project_dir / "thickness"           # 输出厚度的 txt 和最终 shp
 output_dir.mkdir(parents=True, exist_ok=True)
 
-prefixes = [p.stem for p in shp_dir.glob("*.shp")]
+# 读取合并后的 shp（其中 name 字段与 CSV 文件名前缀一致）
+gdf_src = gpd.read_file(shp_file)
 
-crs_wkt = 'GEOGCS["unknown",DATUM["unnamed",SPHEROID["unnamed",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],AXIS["Latitude",NORTH],AXIS["Longitude",EAST]]'
-
+# 记录所有结果点，用于后面生成一个汇总 shp
 all_records = []
 
-for prefix in prefixes:
+crs_wkt = gdf_src.crs.to_wkt()   # ⭐ 保持与原 shp 一致
+
+# 遍历每一个坑
+for idx, row in gdf_src.iterrows():
+    prefix = str(row["name"])          # ⭐ 使用 name 字段作为 CSV 前缀
+
     col_path = base_dir / f"{prefix}_DEM_Col.csv"
     row_path = base_dir / f"{prefix}_DEM_Row.csv"
     col_CF_path = base_dir / f"{prefix}_CF_Col.csv"
     row_CF_path = base_dir / f"{prefix}_CF_Row.csv"
 
+    # 找不到对应 CSV 则跳过
     if not col_path.exists() or not row_path.exists():
+        print(f"⚠ 未找到 CSV，跳过：{prefix}")
         continue
 
+    # 计算厚度
     col_res = calc_mean_elevation(col_path, col_CF_path)
     row_res = calc_mean_elevation(row_path, row_CF_path)
     col_max = get_max_elevation(col_path)
@@ -211,12 +221,15 @@ for prefix in prefixes:
     if col_res["h_left"] >= 0:
         val, lon, lat = col_res["left_peak"]
         all_records.append({"prefix": prefix, "thickness": col_res["h_left"], "geometry": Point(lon, lat)})
+
     if col_res["h_right"] >= 0:
         val, lon, lat = col_res["right_peak"]
         all_records.append({"prefix": prefix, "thickness": col_res["h_right"], "geometry": Point(lon, lat)})
+
     if row_res["h_left"] >= 0:
         val, lon, lat = row_res["left_peak"]
         all_records.append({"prefix": prefix, "thickness": row_res["h_left"], "geometry": Point(lon, lat)})
+
     if row_res["h_right"] >= 0:
         val, lon, lat = row_res["right_peak"]
         all_records.append({"prefix": prefix, "thickness": row_res["h_right"], "geometry": Point(lon, lat)})
@@ -224,7 +237,7 @@ for prefix in prefixes:
 # ---------- 合并生成一个 SHP ----------
 if all_records:
     gdf = gpd.GeoDataFrame(all_records, crs=crs_wkt)
-    out_shp = output_dir / "all_prefixes_points1120.shp"
+    out_shp = output_dir / "all_prefixes_points_YOLO.shp" #⭐记得改名字
     gdf.to_file(out_shp)
     print(f"✅ SHP 已生成: {out_shp}")
 else:
