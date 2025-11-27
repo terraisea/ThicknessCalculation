@@ -33,7 +33,8 @@ def mask_raster(shp_list, tif_path, output_folder, label, field_name):
 
             shp_name = shp.stem
             Path(output_folder).mkdir(parents=True, exist_ok=True)
-            output_filepath = f"{output_folder}/{shp_name}_{value}.tif"
+            output_filepath = f"{output_folder}/{value}.tif"
+            #output_filepath = f"{output_folder}/{shp_name}_{value}.tif"
 
             with rasterio.open(output_filepath, "w", **out_meta) as dest:
                 dest.write(out_image)
@@ -63,11 +64,21 @@ def select_field(shp_list):
 
 
 def main(mode):
-    folder = Path(r"E:\code\geo_processing\database\marius\marius\manual")   #shp文件的文件夹，⭐注意:路径只到文件夹
-    shp_list = list(folder.glob("*.shp"))  #可以自动读取文件夹内的shp
+    folder = Path(r"E:\code\geo_processing\database\marius\marius\YOLO")
+    # ⭐ shp文件所在的文件夹路径，只写到文件夹即可
 
-    tif_path_DEM = r"E:\code\geo_processing\database\marius\marius\demmar.tif" #被掩膜的DEM数据的路径，⭐需要写到该文件的全部路径
-    tif_path_CF = r"E:\code\geo_processing\database\marius\marius\cfmar.tif"    #被掩膜的CF数据的路径，⭐需要写到该文件的全部路径
+    shp_list = list(folder.glob("*.shp"))
+    # ⭐ 自动读取文件夹内所有 shp
+
+    tif_path_DEM = r"E:\code\geo_processing\database\marius\marius\demmar.tif"
+    # ⭐ DEM 数据路径（写到文件完整路径）
+
+    tif_path_CF = r"E:\code\geo_processing\database\marius\marius\cfmar.tif"
+    # ⭐ CF 数据路径（写到文件完整路径）
+
+    # ★ 新增：自动拼接输出目录
+    output_dem = folder / "dem"   # ⭐ 掩膜后的 DEM 输出目录
+    output_cf  = folder / "cf"    # ⭐ 掩膜后的 CF 输出目录
 
     # ★ 新增：选择字段
     field_name = select_field(shp_list)
@@ -77,7 +88,7 @@ def main(mode):
         mask_raster(
             shp_list,
             tif_path_DEM,
-            r"E:\code\geo_processing\database\marius\marius\dem",#掩膜得到的DEM数据的文件夹路径，⭐注意:路径只到文件夹
+            output_dem,  # ⭐ 不再重复输入完整路径
             "DEM",
             field_name
         )
@@ -87,7 +98,7 @@ def main(mode):
         mask_raster(
             shp_list,
             tif_path_CF,
-            r"E:\code\geo_processing\database\marius\marius\CF",#掩膜得到的CF数据的文件夹路径，⭐注意:路径只到文件夹
+            output_cf,   # ⭐ 自动路径
             "CF",
             field_name
         )
@@ -97,19 +108,20 @@ def main(mode):
         mask_raster(
             shp_list,
             tif_path_DEM,
-            r"E:\code\geo_processing\database\marius\marius\dem",#掩膜得到的DEM数据的文件夹路径，⭐注意:路径只到文件夹
+            output_dem,
             "DEM",
             field_name
         )
         mask_raster(
             shp_list,
             tif_path_CF,
-            r"E:\code\geo_processing\database\marius\marius\cf",#掩膜得到的CF数据的文件夹路径，⭐注意:路径只到文件夹
+            output_cf,
             "CF",
             field_name
         )
     else:
         print("未知任务，请使用 --mode a / b / all")
+
 
 
 if __name__ == "__main__":
