@@ -4,19 +4,27 @@ from shapely.geometry import Polygon
 from pathlib import Path
 import numpy as np
 
-with open(r"E:\code\geo_processing\database\marius\CE5\ce5.tif") as dataset:
+with open(r"E:\code\geo_processing\database\ce6\yolo\region\rb.tif") as dataset:
     width = dataset.width
     height = dataset.height
 
-data = np.loadtxt(r"E:\code\geo_processing\database\marius\CE5\cepredictepoch150\kaggle\working\runs\detect\predict4\labels\ce5.txt") #YOLO生成的坐标txt
+data = np.loadtxt(r"E:\code\geo_processing\database\ce6\yolo\rb.txt") #YOLO生成的坐标txt
 rows = len(data)
 
 results = []
-output_folder = r"E:\code\geo_processing\database\ce5"#输出文件夹路径，注意是文件夹
+output_folder = r"E:\code\geo_processing\database\ce6\yolo\shp"#输出文件夹路径，注意是文件夹
 
 # ✅ 同时创建 ExRegion 子文件夹
 Path(output_folder).mkdir(parents=True, exist_ok=True)
 Path(f"{output_folder}/ExRegion").mkdir(parents=True, exist_ok=True)
+
+# ================================
+# 收集合并到一个 SHP 的列表
+# ================================
+poly_list = []
+poly_list_ex = []
+name_list = []
+name_list_ex = []
 
 for i in range(rows):
     x_center = data[i,1]
@@ -57,24 +65,37 @@ for i in range(rows):
     xelb, yelb = dataset.transform * (XE_LB, YE_LB)
     xert, yert = dataset.transform * (XE_RT, YE_RT)
     xerb, yerb = dataset.transform * (XE_RB, YE_RB)
+
     poly_expanded = [(xelt, yelt), (xelb, yelb), (xerb, yerb), (xert, yert), (xelt, yelt)]
     polygon_expanded = Polygon(poly_expanded)
 
-    moon2000_wkt = (
-        'GEOGCS["GCS_Moon_2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400,0]],'
-        'PRIMEM["Reference_Meridian",0],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],'
-        'AXIS["Latitude",NORTH],AXIS["Longitude",EAST]]'
-    )
+    # name 使用 YOLO txt 第二列作为字符串
+    name_val = str(data[i][1])
 
-    gdf_poly = gpd.GeoDataFrame({'name': ['Region1'], 'geometry': [polygon]}, crs=moon2000_wkt)
-    gdf_poly_ex = gpd.GeoDataFrame({'name': ['ExRegion'], 'geometry': [polygon_expanded]}, crs=moon2000_wkt)
+    poly_list.append(polygon)
+    name_list.append(name_val)
 
-    filename = str(data[i][1])
+    poly_list_ex.append(polygon_expanded)
+    name_list_ex.append(name_val)
 
-    output_filepath = f"{output_folder}/{filename}.shp"
-    output_filepath_Ex = f"{output_folder}/ExRegion/{filename}.shp"
+    print(f"已加入 {name_val}")
 
-    gdf_poly.to_file(output_filepath, driver="ESRI Shapefile")
-    gdf_poly_ex.to_file(output_filepath_Ex, driver="ESRI Shapefile")
+# ================================
+# 生成一个 SHP（原框）
+# ================================
+moon2000_wkt = (
+    'GEOGCS["GCS_Moon_2000",DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400,0]],'
+    'PRIMEM["Reference_Meridian",0],UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],'
+    'AXIS["Latitude",NORTH],AXIS["Longitude",EAST]]'
+)
 
-    print(f"✅ Saved {filename}.shp and ExRegion/{filename}.shp")
+gdf_all = gpd.GeoDataFrame({"name": name_list, "geometry": poly_list}, crs=moon2000_wkt)
+gdf_all.to_file(f"{output_folder}/rb_all_boxes.shp", driver="ESRI Shapefile") #⭐记得改路径名
+
+# ================================
+# 生成一个 SHP（ExRegion 扩大框）
+# ================================
+gdf_ex_all = gpd.GeoDataFrame({"name": name_list_ex, "geometry": poly_list_ex}, crs=moon2000_wkt)
+gdf_ex_all.to_file(f"{output_folder}/ExRegion/rb_all_expanded.shp", driver="ESRI Shapefile") #⭐记得改路径名
+
+print("🎉 所有 Polygon 已成功合并输出到两个 SHP 文件！")
