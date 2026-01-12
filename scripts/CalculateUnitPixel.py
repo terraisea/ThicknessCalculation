@@ -44,7 +44,7 @@ def extract_elev_by_slope(slope_vals, slope_idxs, y):
 # ===============================================
 #  读取 DEM 元信息
 # ===============================================
-with rasterio.open(r"E:\code\geo_processing\database\marius\marius\demmar.tif") as src:  #⭐读取dem，通过位置计算坡度，防止纬度升高出现差错
+with rasterio.open(r"E:\code\geo_processing\database\paper\CE5\CE5_dem.tif") as src:  #⭐读取dem，通过位置计算坡度，防止纬度升高出现差错
     transform = src.transform
     xres = abs(transform.a) # 每像元宽度
     yres = abs(transform.e) # 每像元高度
@@ -160,9 +160,9 @@ def calc_mean_elevation(csv_path, cf_path=None):
 # ===============================================
 #  批处理部分（根据合并后的 shp 的 name 字段来处理）
 # ===============================================
-project_dir = Path(r"E:\code\geo_processing\database\marius\marius\YOLO")
+project_dir = Path(r"E:\code\geo_processing\database\paper\CE5\manual")
 
-shp_file = project_dir / "YOLOCarters"     # ⭐ 含有坑信息shp的名字
+shp_file = project_dir / "manual_crater"     # ⭐ 含有坑信息shp的名字
 base_dir = project_dir / "show"                  # 导入 CSV 的路径
 output_dir = project_dir / "thickness"           # 输出厚度的 txt 和最终 shp
 output_dir.mkdir(parents=True, exist_ok=True)
@@ -170,14 +170,28 @@ output_dir.mkdir(parents=True, exist_ok=True)
 # 读取合并后的 shp（其中 name 字段与 CSV 文件名前缀一致）
 gdf_src = gpd.read_file(shp_file)
 
+# ---------- Moon 2000 WKT ----------
+moon2000_wkt = (
+    'GEOGCS["GCS_Moon_2000",'
+    'DATUM["D_Moon_2000",SPHEROID["Moon_2000_IAU_IAG",1737400,0]],'
+    'PRIMEM["Reference_Meridian",0],'
+    'UNIT["degree",0.0174532925199433,AUTHORITY["EPSG","9122"]],'
+    'AXIS["Latitude",NORTH],AXIS["Longitude",EAST]]'
+)
+
+# ---------- CRS 处理（⭐关键修改处） ----------
+if gdf_src.crs is None:
+    print("⚠ 输入 shp 坐标系无效，自动指定为 Moon 2000")
+    crs_wkt = moon2000_wkt
+else:
+    crs_wkt = gdf_src.crs.to_wkt()
+
 # 记录所有结果点，用于后面生成一个汇总 shp
 all_records = []
 
-crs_wkt = gdf_src.crs.to_wkt()   # ⭐ 保持与原 shp 一致
-
 # 遍历每一个坑
 for idx, row in gdf_src.iterrows():
-    prefix = str(row["name"])          # ⭐ 使用 name 字段作为 CSV 前缀
+    prefix = str(row["id"])          # ⭐ YOLO使用 name 字段作为 CSV 前缀,manual使用 id 字段作为 CSV 前缀
 
     col_path = base_dir / f"{prefix}_DEM_Col.csv"
     row_path = base_dir / f"{prefix}_DEM_Row.csv"
@@ -215,7 +229,7 @@ for idx, row in gdf_src.iterrows():
         f.write(f"  left_max  : {row_max[0]:.4f}\n")
         f.write(f"  right_max : {row_max[1]:.4f}\n")
 
-    print(f"✅ Saved {prefix}_thickness.txt")
+    print(f"✅ Saved {prefix}_manual.txt")
 
     # ---------- 构建点记录 ----------
     if col_res["h_left"] >= 0:
@@ -237,7 +251,7 @@ for idx, row in gdf_src.iterrows():
 # ---------- 合并生成一个 SHP ----------
 if all_records:
     gdf = gpd.GeoDataFrame(all_records, crs=crs_wkt)
-    out_shp = output_dir / "all_prefixes_points_YOLO.shp" #⭐记得改名字
+    out_shp = output_dir / "all_manual.shp" #⭐记得改名字
     gdf.to_file(out_shp)
     print(f"✅ SHP 已生成: {out_shp}")
 else:
