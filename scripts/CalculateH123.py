@@ -7,6 +7,21 @@ import numpy as np
 import pandas as pd
 
 
+DEFAULT_SHOW_DIR = Path(r"Database\CE5\yolo\show")
+DEFAULT_DATASET_DIR = Path(r"Database\CE5")
+DEFAULT_SOURCE = "yolo"
+
+
+def resolve_dataset_and_source(show_dir: Path):
+    show_dir = Path(show_dir)
+    if show_dir.name.lower() != "show":
+        raise ValueError(f"-dir 应直接指向 show 目录，例如 Database\\CE5\\yolo\\show；当前为：{show_dir}")
+    source_dir = show_dir.parent
+    dataset_dir = source_dir.parent
+    source = source_dir.name
+    return dataset_dir, source
+
+
 # python scripts\CalculateH123.py --dataset-dir Database\CE5 --source yolo
 
 
@@ -555,9 +570,12 @@ def main(dataset_dir, source,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="基于原始 DEM 剖面的 h1/h2/h3/h3t 计算脚本")
-    parser.add_argument("--dataset-dir", required=True, help=r"数据集目录，例如：Database\CE5")
-    parser.add_argument("--source", "--shp", dest="source", choices=["manual", "yolo"], required=True,
-                        help="选择子目录：manual / yolo")
+    parser.add_argument("-dir", "--dir", default=str(DEFAULT_SHOW_DIR),
+                        help=r"直接指定 show 目录，例如：Database\CE5\yolo\show")
+    parser.add_argument("--dataset-dir", default=None,
+                        help=r"数据集目录，例如：Database\CE5；通常不必手填")
+    parser.add_argument("--source", "--shp", dest="source", choices=["manual", "yolo"], default=None,
+                        help="选择子目录：manual / yolo；通常不必手填")
     parser.add_argument("--rim-search-frac", type=float, default=0.70,
                         help="rim 搜索范围占半边比例，默认 0.70")
     parser.add_argument("--max-rim-candidates", type=int, default=8,
@@ -576,9 +594,16 @@ if __name__ == "__main__":
                         help="坡底点距 rim 的最小像元数，默认 1")
 
     args = parser.parse_args()
+
+    if args.dataset_dir is not None and args.source is not None:
+        dataset_dir = Path(args.dataset_dir)
+        source = args.source
+    else:
+        dataset_dir, source = resolve_dataset_and_source(Path(args.dir))
+
     main(
-        dataset_dir=args.dataset_dir,
-        source=args.source,
+        dataset_dir=dataset_dir,
+        source=source,
         rim_search_frac=args.rim_search_frac,
         max_rim_candidates=args.max_rim_candidates,
         window_sizes=parse_window_sizes(args.window_sizes),

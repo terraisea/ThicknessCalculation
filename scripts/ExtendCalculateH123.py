@@ -858,11 +858,17 @@ def run(dem_path: Path, shp_path: Path, output_dir: Path, output_tag: str = OUTP
     print(f'剔除记录数    : {len(reject_df)}')
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='一体化 ExtendCalculateH123：输入 shp + DEM，core 保持原 shp，outer flat 先 core 后 extend，再计算 h1/h2/h3')
-    parser.add_argument('--dem', default=str(DEFAULT_DEM_PATH), help='DEM 路径')
-    parser.add_argument('--shp', default=str(DEFAULT_SHP_PATH), help='SHP 路径')
-    parser.add_argument('--output-dir', default=str(DEFAULT_OUTPUT_DIR), help='输出目录')
-    parser.add_argument('--tag', default=OUTPUT_TAG, help='输出文件名前缀标签，例如 yolo')
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="一体化 ExtendCalculateH123：输入 shp + DEM，core 保持原 shp，outer flat 先 core 后 extend，再计算 h1/h2/h3")
+    parser.add_argument("-dir", "--dir", "--shp", dest="shp", default=str(DEFAULT_SHP_PATH), help="SHP 路径")
+    parser.add_argument("-dem", "--dem", dest="dem", default=str(DEFAULT_DEM_PATH), help="DEM 路径")
+    parser.add_argument("-out", "--out", "--output-dir", dest="output_dir", default=str(DEFAULT_OUTPUT_DIR), help="输出目录")
+    parser.add_argument("-tag", "--tag", dest="tag", default=OUTPUT_TAG, help="输出文件名前缀标签，例如 yolo")
     args = parser.parse_args()
-    run(Path(args.dem), Path(args.shp), Path(args.output_dir), args.tag)
+
+    run(
+        dem_path=Path(args.dem),
+        shp_path=Path(args.shp),
+        output_dir=Path(args.output_dir),
+        output_tag=args.tag,
+    )
