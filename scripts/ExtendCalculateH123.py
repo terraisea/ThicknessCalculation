@@ -1,7 +1,7 @@
 import argparse
 import math
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import geopandas as gpd
 import numpy as np
@@ -14,33 +14,49 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
+# =========================
+# Easy-to-edit input/output paths
+# =========================
 DEFAULT_DEM_PATH = Path(r"Database\CE5\CE5_dem.tif")
-DEFAULT_SHP_PATH = Path(r"Database\CE5\keyextend_ce5.shp")
-DEFAULT_OUTPUT_DIR = Path(r"Database\CE5\yolo\chickin\extend")
-OUTPUT_TAG = "yolo"
+DEFAULT_SHP_PATH = Path(r"Database/CE5/exce5/yolo_ce5.shp")
+DEFAULT_STEP1_REJECT_CSV = Path(r"Database\CE5\yolo\chickin\step1\all_yolo_h123_reject.csv")
+DEFAULT_OUTPUT_DIR = Path(r"Database\CE5\yolo\chickin\step2")
+PLOT_DIRNAME = "plots"
+CORE_SHP_NAME = "yolo_core_boxes.shp"
+EXPAND_SHP_NAME = "yolo_expand_boxes.shp"
+VALID_CSV_NAME = "all_yolo_h123.csv"
+REJECT_CSV_NAME = "all_yolo_h123_reject.csv"
 
+# =========================
+# Parameters (keep original Extend core/expand logic unchanged)
+# =========================
 INVALID_LOW = -3e10
 INVALID_ZERO = True
 MOON_RADIUS_M = 1737400.0
 
-OUTER_DEPTH_RATIO = 1.20
+OUTER_DEPTH_RATIO = 1.50
 OUTER_DEPTH_MIN_PX = 20
-OUTER_DEPTH_MAX_PX = 160
+OUTER_DEPTH_MAX_PX = 200
 
-FLOAT_BAND_RATIO = 0.10
-FLOAT_BAND_MIN_PX = 1
-FLOAT_BAND_MAX_PX = 6
-
-SLOPE_THRESHOLD = 3.0
+SLOPE_THRESHOLD_DEG = 3.0
 OVERALL_THRESHOLD = 8.0
 WINDOW_SIZES = (3, 5)
-
+MIN_INNER_OFFSET = 1
 MAX_RIM_CANDIDATES = 10
 MAX_OUTER_SEGMENTS_PER_PROFILE = 6
-MIN_INNER_OFFSET = 1
-SHOW_DIRNAME = 'show'
+FIG_DPI = 180
+
+# step2 fallback
+V_NOTCH_MIN_DEPTH_M = 5.0
+V_NOTCH_MAX_CANDIDATES = 3
+OUTER_REF_TYPE_STRICT_FLAT = 'strict_flat'
+OUTER_REF_TYPE_V_NOTCH = 'v_notch_higher_peak'
+OUTER_REF_TYPE_LOWEST_POINT = 'lowest_point_between_peaks'
 
 
+# -------------------------
+# basic utils
+# -------------------------
 def clip_int(v: float, vmin: int, vmax: int) -> int:
     return int(max(vmin, min(vmax, round(v))))
 
@@ -85,157 +101,56 @@ def calc_point_slopes(values, lon, lat):
     return slopes
 
 
-def segment_linear_trend(vals: np.ndarray) -> float:
-    vals = np.asarray(vals, dtype=float)
-    vals = vals[np.isfinite(vals)]
-    if vals.size < 2:
-        return 0.0
-    x = np.arange(vals.size, dtype=float)
-    try:
-        return float(np.polyfit(x, vals, 1)[0])
-    except Exception:
-        return 0.0
+def crs_body_type(crs) -> str:
+    if crs is None:
+        return 'none'
+    s = str(crs).lower()
+    if 'moon' in s or 'selen' in s or '1737400' in s or 'iau' in s:
+        return 'moon'
+    if 'wgs84' in s or '4326' in s or 'greenwich' in s or '6378137' in s or '298.257223563' in s:
+        return 'earth'
+    return 'other'
 
 
-def flat_window_ok(window_slopes, slope_threshold=SLOPE_THRESHOLD, overall_threshold=OVERALL_THRESHOLD):
-    ws = np.asarray(window_slopes, dtype=float)
-    ws = ws[np.isfinite(ws)]
-    if ws.size == 0:
-        return False
-    need = int(np.ceil(ws.size / 2.0))
-    count_lt = int(np.sum(ws < slope_threshold))
-    return (count_lt >= need) and (np.nanmax(ws) <= overall_threshold)
+def harmonize_vector_raster_crs(gdf, ds):
+    if ds.crs is None:
+        raise ValueError('输入 DEM 没有 CRS，无法与 shp 对齐。')
+    print(f'shp CRS: {gdf.crs}')
+    print(f'DEM CRS: {ds.crs}')
 
+    if gdf.crs is None:
+        print('shp 没有 CRS，直接赋值为 DEM 的 CRS，不做坐标变换。')
+        gdf = gdf.set_crs(ds.crs)
+        return gdf, ds.crs
+    if gdf.crs == ds.crs:
+        print('shp 与 DEM CRS 一致，无需转换。')
+        return gdf, gdf.crs
 
-def valid_sequence(order_indices, slopes, values=None):
-    seq = []
-    n = len(slopes)
-    for idx in order_indices:
-        if not (0 <= idx < n):
-            continue
-        if not np.isfinite(slopes[idx]):
-            continue
-        if values is not None and not np.isfinite(values[idx]):
-            continue
-        seq.append(int(idx))
-    return seq
+    shp_body = crs_body_type(gdf.crs)
+    dem_body = crs_body_type(ds.crs)
+    shp_txt = str(gdf.crs).lower()
+    dem_txt = str(ds.crs).lower()
+    shp_is_geographic = 'degree' in shp_txt or 'geogcs' in shp_txt or 'geographic' in shp_txt
+    dem_is_geographic = 'degree' in dem_txt or 'geogcs' in dem_txt or 'geographic' in dem_txt
 
+    if shp_body == 'moon' and dem_body == 'earth' and shp_is_geographic and dem_is_geographic:
+        print('检测到 shp 是月球坐标，而 DEM 被错误标成地球 geographic CRS。')
+        print('不进行坐标变换，直接沿用 shp 的月球 CRS 作为工作 CRS。')
+        return gdf, gdf.crs
 
-def find_flat_segments(order_indices, slopes, values,
-                       window_sizes=WINDOW_SIZES,
-                       slope_threshold=SLOPE_THRESHOLD,
-                       overall_threshold=OVERALL_THRESHOLD,
-                       max_segments=MAX_OUTER_SEGMENTS_PER_PROFILE):
-    seq = valid_sequence(order_indices, slopes, values)
-    if len(seq) < 3:
-        return []
-    segments = []
-    seen = set()
-    for k in sorted(set(int(w) for w in window_sizes if int(w) >= 3)):
-        if len(seq) < k:
-            continue
-        good = [flat_window_ok(slopes[seq[i:i + k]], slope_threshold, overall_threshold)
-                for i in range(len(seq) - k + 1)]
-        i = 0
-        while i < len(good):
-            if not good[i]:
-                i += 1
-                continue
-            j = i
-            while j + 1 < len(good) and good[j + 1]:
-                j += 1
-            pts = seq[i:j + k]
-            first_idx = int(pts[0]); last_idx = int(pts[-1])
-            key = (first_idx, last_idx)
-            if key not in seen:
-                seen.add(key)
-                lo = min(first_idx, last_idx); hi = max(first_idx, last_idx)
-                vals = clean_profile_values(values[lo:hi + 1])
-                seg_slopes = slopes[pts]
-                seg_slopes = seg_slopes[np.isfinite(seg_slopes)]
-                if vals.size > 0 and seg_slopes.size > 0:
-                    segments.append({
-                        'kind': 'flat',
-                        'first_idx': first_idx,
-                        'last_idx': last_idx,
-                        'indices': pts,
-                        'mean': float(np.nanmean(vals)),
-                        'median': float(np.nanmedian(vals)),
-                        'min': float(np.nanmin(vals)),
-                        'elev_std': float(np.nanstd(vals)),
-                        'relief': float(np.nanmax(vals) - np.nanmin(vals)),
-                        'slope_mean': float(np.nanmean(seg_slopes)),
-                        'slope_max': float(np.nanmax(seg_slopes)),
-                        'trend': segment_linear_trend(vals),
-                        'n': int(vals.size),
-                    })
-            i = j + 1
-    return segments[:max_segments]
+    if shp_body == 'earth' and dem_body == 'moon' and shp_is_geographic and dem_is_geographic:
+        print('检测到 shp 是地球 geographic CRS，而 DEM 是月球坐标。')
+        print('不进行坐标变换，直接覆盖 shp CRS 为 DEM CRS。')
+        gdf = gdf.set_crs(ds.crs, allow_override=True)
+        return gdf, ds.crs
 
-
-def find_outer_inflection_anchor(order_indices, slopes, values, max_candidates=2):
-    seq = valid_sequence(order_indices, slopes, values)
-    if len(seq) < 5:
-        return []
-    s = np.array([slopes[i] for i in seq], dtype=float)
-    z = np.array([values[i] for i in seq], dtype=float)
-    # smooth slope and elevation increments
-    s_smooth = np.array([np.nanmean(s[max(0, i-1):min(len(s), i+2)]) for i in range(len(s))], dtype=float)
-    dz = np.diff(z)
-    if dz.size == 0:
-        return []
-    results = []
-    # find first outward segment that has appreciable gradient, then drops toward flatter behavior
-    for i in range(2, len(seq) - 2):
-        prev_mean = np.nanmean(s_smooth[max(0, i-2):i+1])
-        next_mean = np.nanmean(s_smooth[i+1:min(len(seq), i+4)])
-        if not (np.isfinite(prev_mean) and np.isfinite(next_mean)):
-            continue
-        if prev_mean < 1.5:
-            continue
-        # gradient magnitude decreases markedly or enters low-slope regime
-        if next_mean <= max(SLOPE_THRESHOLD, prev_mean * 0.55):
-            i0 = max(0, i-1)
-            i1 = min(len(seq)-1, i+1)
-            pts = seq[i0:i1+1]
-            vals = np.array([values[p] for p in pts], dtype=float)
-            ss = np.array([slopes[p] for p in pts], dtype=float)
-            results.append({
-                'kind': 'inflection',
-                'first_idx': int(pts[0]),
-                'last_idx': int(pts[-1]),
-                'indices': list(map(int, pts)),
-                'mean': float(np.nanmean(vals)),
-                'median': float(np.nanmedian(vals)),
-                'min': float(np.nanmin(vals)),
-                'elev_std': float(np.nanstd(vals)),
-                'relief': float(np.nanmax(vals) - np.nanmin(vals)),
-                'slope_mean': float(np.nanmean(ss[np.isfinite(ss)])) if np.any(np.isfinite(ss)) else np.inf,
-                'slope_max': float(np.nanmax(ss[np.isfinite(ss)])) if np.any(np.isfinite(ss)) else np.inf,
-                'trend': segment_linear_trend(vals),
-                'n': int(vals.size),
-                'anchor_idx': int(seq[i]),
-            })
-            if len(results) >= max_candidates:
-                break
-    return results
-
-
-def terrain_rank(seg: Dict, axis_offset: int):
-    trend = abs(float(seg.get('trend', np.nan))) if np.isfinite(seg.get('trend', np.nan)) else np.inf
-    kind_priority = 0 if seg.get('kind') == 'flat' else 1
-    return (
-        kind_priority,
-        round(seg['slope_mean'], 6),
-        round(seg['elev_std'], 6),
-        round(seg['relief'], 6),
-        round(trend, 6),
-        abs(int(axis_offset)),
-    )
+    print('执行真正的 CRS 转换：gdf.to_crs(ds.crs)')
+    gdf = gdf.to_crs(ds.crs)
+    return gdf, ds.crs
 
 
 def infer_name_field(gdf: gpd.GeoDataFrame) -> str:
-    for field in ['id', 'name', 'fid']:
+    for field in ['name', 'Name', 'NAME', 'id', 'ID', 'fid', 'FID']:
         if field in gdf.columns:
             return field
     return '__index__'
@@ -262,12 +177,15 @@ def geom_bounds_to_rc(src, geom) -> Tuple[int, int, int, int]:
     r1, c1 = src.index(maxx, miny)
     rmin, rmax = sorted((r0, r1))
     cmin, cmax = sorted((c0, c1))
-    rmin = max(0, rmin); cmin = max(0, cmin)
-    rmax = min(src.height - 1, rmax); cmax = min(src.width - 1, cmax)
+    rmin = max(0, rmin)
+    cmin = max(0, cmin)
+    rmax = min(src.height - 1, rmax)
+    cmax = min(src.width - 1, cmax)
     return rmin, rmax, cmin, cmax
 
 
 def make_boxes_from_original(rmin: int, rmax: int, cmin: int, cmax: int, src) -> Dict:
+    # keep original Extend core / expand algorithm unchanged
     core_h = max(1, rmax - rmin + 1)
     core_w = max(1, cmax - cmin + 1)
     out_dx = clip_int(core_w * OUTER_DEPTH_RATIO, OUTER_DEPTH_MIN_PX, OUTER_DEPTH_MAX_PX)
@@ -281,6 +199,8 @@ def make_boxes_from_original(rmin: int, rmax: int, cmin: int, cmax: int, src) ->
         'expanded': {'rmin': exp_rmin, 'rmax': exp_rmax, 'cmin': exp_cmin, 'cmax': exp_cmax},
         'core_h': core_h,
         'core_w': core_w,
+        'expand_dx': out_dx,
+        'expand_dy': out_dy,
     }
 
 
@@ -300,139 +220,382 @@ def read_window(src, rmin: int, rmax: int, cmin: int, cmax: int):
     return arr, transform
 
 
-def center_candidates_from_bounds(lo: int, hi: int) -> List[int]:
-    n = hi - lo + 1
-    c1 = lo + max(0, n // 2 - 1)
-    c2 = lo + min(max(0, n // 2), max(0, n - 1))
-    out = []
-    for c in [c1, c2]:
-        if lo <= c <= hi and c not in out:
-            out.append(c)
-    return out
+# -------------------------
+# morphology helpers reused from current step2
+# -------------------------
+def flat_window_ok(window_slopes, slope_threshold=SLOPE_THRESHOLD_DEG, overall_threshold=OVERALL_THRESHOLD):
+    ws = np.asarray(window_slopes, dtype=float)
+    ws = ws[np.isfinite(ws)]
+    if ws.size == 0:
+        return False
+    need = int(np.ceil(ws.size / 2.0))
+    count_lt = int(np.sum(ws < slope_threshold))
+    return (count_lt >= need) and (np.nanmax(ws) <= overall_threshold)
 
 
-def profile_depth_score(profile: np.ndarray, lo: int, hi: int) -> float:
-    vals = clean_profile_values(profile[lo:hi+1])
-    if vals.size < 6 or not np.any(np.isfinite(vals)):
-        return -np.inf
-    n = len(vals)
-    left = vals[:max(2, n//4)]
-    center = vals[max(0, n//3):min(n, 2*n//3)]
-    right = vals[min(n-2, 3*n//4):]
-    if not (np.any(np.isfinite(left)) and np.any(np.isfinite(center)) and np.any(np.isfinite(right))):
-        return -np.inf
-    rim = 0.5 * (np.nanmax(left) + np.nanmax(right))
-    bottom = np.nanmin(center)
-    return float(rim - bottom)
+def valid_sequence(order_indices, slopes, values=None):
+    seq = []
+    n = len(slopes)
+    for idx in order_indices:
+        if not (0 <= idx < n):
+            continue
+        if not np.isfinite(slopes[idx]):
+            continue
+        if values is not None and not np.isfinite(values[idx]):
+            continue
+        seq.append(int(idx))
+    return seq
 
 
-def refine_center_indices(data: np.ndarray, core: Dict) -> Tuple[List[int], List[int]]:
-    # local DEM re-centering before building clusters
-    r0s = center_candidates_from_bounds(core['rmin'], core['rmax'])
-    c0s = center_candidates_from_bounds(core['cmin'], core['cmax'])
-    r0 = r0s[0]
-    c0 = c0s[0]
-    band_r = min(clip_int((core['rmax'] - core['rmin'] + 1) * 0.15, 2, 4), core['rmax'] - core['rmin'])
-    band_c = min(clip_int((core['cmax'] - core['cmin'] + 1) * 0.15, 2, 4), core['cmax'] - core['cmin'])
-    row_cands = list(range(max(core['rmin'], r0 - band_r), min(core['rmax'], r0 + band_r) + 1))
-    col_cands = list(range(max(core['cmin'], c0 - band_c), min(core['cmax'], c0 + band_c) + 1))
-    row_scored = []
-    for r in row_cands:
-        row_scored.append((-(profile_depth_score(data[r, :], core['cmin'], core['cmax'])), abs(r-r0), r))
-    col_scored = []
-    for c in col_cands:
-        col_scored.append((-(profile_depth_score(data[:, c], core['rmin'], core['rmax'])), abs(c-c0), c))
-    row_scored.sort(); col_scored.sort()
-    best_rows = []
-    best_cols = []
-    for _,_,r in row_scored[:2]:
-        if r not in best_rows:
-            best_rows.append(r)
-    for _,_,c in col_scored[:2]:
-        if c not in best_cols:
-            best_cols.append(c)
-    if r0 not in best_rows:
-        best_rows.append(r0)
-    if c0 not in best_cols:
-        best_cols.append(c0)
-    return best_rows, best_cols
+def find_strict_outer_flat(order_indices, slopes, values,
+                           consecutive=3,
+                           slope_threshold=SLOPE_THRESHOLD_DEG):
+    """
+    严格平坦区判定：必须连续 3 个坡度点都 < 3°。
+    这里的判据本身就是“3 个连续坡度点”，不额外附加“5 个像元”条件。
+    搜索顺序按 outward_order 从靠近 rim 到远离 rim 进行，返回最近的一段平坦区。
+    """
+    seq = valid_sequence(order_indices, slopes, values)
+    if len(seq) < consecutive:
+        return None
+
+    run_start = None
+    for i in range(len(seq) - consecutive + 1):
+        w = seq[i:i + consecutive]
+        # 必须是原生索引连续
+        step = -1 if len(w) >= 2 and w[1] < w[0] else 1
+        if any(w[j + 1] - w[j] != step for j in range(len(w) - 1)):
+            continue
+        s = np.asarray([slopes[idx] for idx in w], dtype=float)
+        if np.all(np.isfinite(s)) and np.all(s < slope_threshold):
+            run_start = i
+            break
+    if run_start is None:
+        return None
+
+    step = -1 if len(seq) >= 2 and seq[1] < seq[0] else 1
+    start_slope = seq[run_start]
+    end_slope = seq[run_start + consecutive - 1]
+
+    j = run_start + consecutive
+    while j < len(seq):
+        prev_idx = seq[j - 1]
+        this_idx = seq[j]
+        if this_idx - prev_idx != step:
+            break
+        if not (np.isfinite(slopes[this_idx]) and slopes[this_idx] < slope_threshold and np.isfinite(values[this_idx])):
+            break
+        end_slope = this_idx
+        j += 1
+
+    val_start = max(0, min(start_slope, end_slope) - 1)
+    val_end = min(len(values) - 1, max(start_slope, end_slope) + 1)
+    seg_vals = clean_profile_values(values[val_start:val_end + 1])
+    seg_slopes = np.asarray([slopes[idx] for idx in seq[run_start:j] if np.isfinite(slopes[idx])], dtype=float)
+    if seg_vals.size == 0 or seg_slopes.size == 0:
+        return None
+
+    return {
+        'kind': OUTER_REF_TYPE_STRICT_FLAT,
+        'first_idx': int(val_start),
+        'last_idx': int(val_end),
+        'indices': list(range(int(min(start_slope, end_slope)), int(max(start_slope, end_slope)) + 1)),
+        'mean': float(np.nanmean(seg_vals)),
+        'median': float(np.nanmedian(seg_vals)),
+        'min': float(np.nanmin(seg_vals)),
+        'max': float(np.nanmax(seg_vals)),
+        'elev_std': float(np.nanstd(seg_vals)),
+        'relief': float(np.nanmax(seg_vals) - np.nanmin(seg_vals)),
+        'slope_mean': float(np.nanmean(seg_slopes)),
+        'slope_max': float(np.nanmax(seg_slopes)),
+        'n': int(seg_vals.size),
+    }
 
 
-def profile_floor_score(values: np.ndarray, slopes: np.ndarray, core_lo: int, core_hi: int) -> Tuple:
-    vals = clean_profile_values(values[core_lo:core_hi + 1])
-    slp = np.asarray(slopes[core_lo:core_hi + 1], dtype=float)
-    finite = np.isfinite(vals)
-    if not np.any(finite):
-        return (np.inf, np.inf, np.inf, np.inf)
-    center_min = float(np.nanmin(vals[finite]))
-    low_count = int(np.sum(np.isfinite(slp) & (slp < SLOPE_THRESHOLD)))
-    relief = float(np.nanmax(vals[finite]) - np.nanmin(vals[finite]))
-    return (-low_count, center_min, relief, 0)
+def find_outer_v_notches(order_indices, values, max_candidates=V_NOTCH_MAX_CANDIDATES, min_depth=V_NOTCH_MIN_DEPTH_M):
+    seq = [idx for idx in order_indices if 0 <= idx < len(values) and np.isfinite(values[idx])]
+    if len(seq) < 5:
+        return []
+    z = np.asarray([values[i] for i in seq], dtype=float)
+    peak_pos = []
+    for p in range(1, len(seq) - 1):
+        if z[p] >= z[p - 1] and z[p] >= z[p + 1]:
+            peak_pos.append(p)
+    if len(peak_pos) < 2:
+        return []
+    results = []
+    for a, b in zip(peak_pos[:-1], peak_pos[1:]):
+        if b - a < 2:
+            continue
+        valley_rel = int(np.argmin(z[a:b + 1]))
+        valley_pos = a + valley_rel
+        if valley_pos <= a or valley_pos >= b:
+            continue
+        valley_idx = int(seq[valley_pos])
+        z_left = float(z[a])
+        z_right = float(z[b])
+        z_valley = float(z[valley_pos])
+        depth = min(z_left, z_right) - z_valley
+        if not np.isfinite(depth) or depth < min_depth:
+            continue
+        results.append({
+            'kind': OUTER_REF_TYPE_V_NOTCH,
+            'first_idx': valley_idx,
+            'last_idx': valley_idx,
+            'indices': [valley_idx],
+            'mean': z_valley,
+            'median': z_valley,
+            'min': z_valley,
+            'elev_std': 0.0,
+            'relief': depth,
+            'slope_mean': np.nan,
+            'slope_max': np.nan,
+            'n': 1,
+            'anchor_idx': valley_idx,
+            'near_rank': valley_pos,
+            'left_peak_elev': z_left,
+            'right_peak_elev': z_right,
+        })
+        if len(results) >= max_candidates:
+            break
+    results.sort(key=lambda d: (d['near_rank'], -d['relief']))
+    return results
 
 
-def candidate_rows(core_rmin: int, core_rmax: int, preferred_centers: Optional[List[int]] = None) -> List[int]:
-    centers = preferred_centers or center_candidates_from_bounds(core_rmin, core_rmax)
-    band = clip_int((core_rmax - core_rmin + 1) * FLOAT_BAND_RATIO, FLOAT_BAND_MIN_PX, FLOAT_BAND_MAX_PX)
-    rows = set()
-    for center in centers:
-        rows.update(range(max(core_rmin, center - band), min(core_rmax, center + band) + 1))
-    rows = list(rows)
-    rows.sort(key=lambda r: min(abs(r - c) for c in centers))
-    return rows
+def find_outward_local_peaks(order_indices, values):
+    seq = [idx for idx in order_indices if 0 <= idx < len(values) and np.isfinite(values[idx])]
+    if len(seq) < 3:
+        return []
+    z = np.asarray([values[i] for i in seq], dtype=float)
+    peaks = []
+    for p in range(1, len(seq) - 1):
+        if z[p] >= z[p - 1] and z[p] >= z[p + 1]:
+            peaks.append({
+                'idx': int(seq[p]),
+                'elev': float(z[p]),
+                'near_rank': int(p),
+            })
+    return peaks
 
 
-def candidate_cols(core_cmin: int, core_cmax: int, preferred_centers: Optional[List[int]] = None) -> List[int]:
-    centers = preferred_centers or center_candidates_from_bounds(core_cmin, core_cmax)
-    band = clip_int((core_cmax - core_cmin + 1) * FLOAT_BAND_RATIO, FLOAT_BAND_MIN_PX, FLOAT_BAND_MAX_PX)
-    cols = set()
-    for center in centers:
-        cols.update(range(max(core_cmin, center - band), min(core_cmax, center + band) + 1))
-    cols = list(cols)
-    cols.sort(key=lambda c: min(abs(c - cc) for cc in centers))
-    return cols
+def build_lowest_point_between_peaks(rim_idx, lower_peak_idx, values):
+    lo = int(min(rim_idx, lower_peak_idx))
+    hi = int(max(rim_idx, lower_peak_idx))
+    if hi - lo < 2:
+        return None
+    cand = [i for i in range(lo + 1, hi) if np.isfinite(values[i])]
+    if not cand:
+        return None
+    local_vals = np.asarray([values[i] for i in cand], dtype=float)
+    pos = int(np.argmin(local_vals))
+    idx = int(cand[pos])
+    val = float(local_vals[pos])
+    return {
+        'kind': OUTER_REF_TYPE_LOWEST_POINT,
+        'first_idx': idx,
+        'last_idx': idx,
+        'indices': [idx],
+        'mean': val,
+        'median': val,
+        'min': val,
+        'max': val,
+        'elev_std': 0.0,
+        'relief': float(max(values[rim_idx], values[lower_peak_idx]) - val) if np.isfinite(values[rim_idx]) and np.isfinite(values[lower_peak_idx]) else 0.0,
+        'slope_mean': np.nan,
+        'slope_max': np.nan,
+        'n': 1,
+        'near_rank': abs(idx - rim_idx),
+        'lower_peak_idx': int(lower_peak_idx),
+        'lower_peak_elev': float(values[lower_peak_idx]) if np.isfinite(values[lower_peak_idx]) else np.nan,
+    }
 
 
-def build_profile_coords_row(transform, ncols: int, row_idx: int):
-    cols = np.arange(ncols)
-    rows = np.full(ncols, row_idx, dtype=int)
-    lon, lat = rasterio.transform.xy(transform, rows, cols)
-    return np.asarray(lon, dtype=float), np.asarray(lat, dtype=float)
+def _is_peak_like_within_range(values: np.ndarray, idx: int, lo: int, hi: int) -> bool:
+    idx = int(idx)
+    lo = int(lo)
+    hi = int(hi)
+    if idx < lo or idx > hi or not np.isfinite(values[idx]):
+        return False
+
+    left_candidates = [j for j in (idx - 1, idx - 2) if lo <= j <= hi and np.isfinite(values[j])]
+    right_candidates = [j for j in (idx + 1, idx + 2) if lo <= j <= hi and np.isfinite(values[j])]
+
+    left_ok = True if not left_candidates else all(values[idx] >= values[j] for j in left_candidates)
+    right_ok = True if not right_candidates else all(values[idx] >= values[j] for j in right_candidates)
+    return bool(left_ok and right_ok)
 
 
-def build_profile_coords_col(transform, nrows: int, col_idx: int):
-    rows = np.arange(nrows)
-    cols = np.full(nrows, col_idx, dtype=int)
-    lon, lat = rasterio.transform.xy(transform, rows, cols)
-    return np.asarray(lon, dtype=float), np.asarray(lat, dtype=float)
+def _find_boundary_window_candidates(values: np.ndarray, side: str, lo: int, hi: int,
+                                     boundary_idx: int, center_idx: int,
+                                     window: int = 3) -> List[int]:
+    """
+    在 core 边界附近优先找“真正的峰”，而不是把边界单点直接当成坑顶。
+
+    规则：
+    1) 仅在 boundary 附近 window 个像元内找；
+    2) 优先返回该窗口内满足 peak-like 条件的点；
+    3) 若窗口内没有 peak-like 点，再退化为窗口内最高点；
+    4) 这样可以处理 core 正好切到 rim crest，或只差 1~2 个像元的情况，
+       同时避免把开口向上的肩部/拐点直接当成坑顶。
+    """
+    lo = int(lo)
+    hi = int(hi)
+    boundary_idx = int(boundary_idx)
+    if hi < lo:
+        return []
+
+    if side == 'left':
+        w_lo = max(lo, boundary_idx)
+        w_hi = min(hi, boundary_idx + max(0, int(window) - 1))
+    else:
+        w_lo = max(lo, boundary_idx - max(0, int(window) - 1))
+        w_hi = min(hi, boundary_idx)
+
+    cand = [i for i in range(w_lo, w_hi + 1) if np.isfinite(values[i])]
+    if not cand:
+        return []
+
+    peak_like = [i for i in cand if _is_peak_like_within_range(values, i, lo, hi)]
+    if peak_like:
+        peak_like = sorted(peak_like, key=lambda i: (abs(i - boundary_idx), -values[i], abs(i - center_idx)))
+        return [int(i) for i in peak_like]
+
+    fallback = sorted(cand, key=lambda i: (-values[i], abs(i - boundary_idx), abs(i - center_idx)))
+    return [int(fallback[0])] if fallback else []
 
 
 def find_local_peak_candidates(values: np.ndarray, start_idx: int, end_idx: int, center_idx: int,
-                               max_candidates: int = MAX_RIM_CANDIDATES) -> List[int]:
+                               max_candidates: int = MAX_RIM_CANDIDATES,
+                               priority_boundary_idx: Optional[int] = None,
+                               side: Optional[str] = None,
+                               boundary_window: int = 3) -> List[int]:
+    """
+    core 内坑顶候选搜索。
+
+    新规则：
+    1) 先在 core 边界附近的小窗口内找“真正的峰”；
+    2) 若边界窗口内没有 peak-like 点，则退化为窗口内最高点；
+    3) 再补充 core 半边内部的局部峰；
+    4) 只要 core 半边内已经得到候选，就不再去 core 外找峰。
+    """
     lo = int(min(start_idx, end_idx))
     hi = int(max(start_idx, end_idx))
-    if hi - lo + 1 < 3:
+    if hi < lo:
         return []
+
+    out = []
+    seen = set()
+
+    def push(idx: int):
+        idx = int(idx)
+        if idx in seen:
+            return
+        if idx < lo or idx > hi:
+            return
+        if not np.isfinite(values[idx]):
+            return
+        seen.add(idx)
+        out.append(idx)
+
+    boundary = None
+    if priority_boundary_idx is not None and side in ('left', 'right'):
+        boundary = int(priority_boundary_idx)
+        for idx in _find_boundary_window_candidates(values, side, lo, hi, boundary, center_idx, window=boundary_window):
+            push(idx)
+            if len(out) >= max_candidates:
+                return [int(v) for v in out]
+
     idxs = []
+    if hi - lo + 1 >= 3:
+        for i in range(lo + 1, hi):
+            if not (np.isfinite(values[i - 1]) and np.isfinite(values[i]) and np.isfinite(values[i + 1])):
+                continue
+            if values[i] >= values[i - 1] and values[i] >= values[i + 1]:
+                idxs.append(i)
+
+    if boundary is not None:
+        idxs = sorted(idxs, key=lambda i: (abs(i - boundary), -values[i], abs(i - center_idx)))
+    else:
+        idxs = sorted(idxs, key=lambda i: (-values[i], abs(i - center_idx)))
+
+    for i in idxs:
+        push(i)
+        if len(out) >= max_candidates:
+            return [int(v) for v in out]
+
+    return [int(v) for v in out]
+
+
+def find_nearest_peak_outside_core(values: np.ndarray, side: str,
+                                   core_lo: int, core_hi: int,
+                                   ext_lo: int, ext_hi: int) -> Optional[int]:
+    """
+    先在 core 内找；若当前侧 core 内没有局部峰，则在 core 外同侧寻找离 core 最近的那个峰。
+    left 侧：在 [ext_lo, core_lo-1] 内找，优先离 core_lo 最近；
+    right 侧：在 [core_hi+1, ext_hi] 内找，优先离 core_hi 最近。
+    """
+    n = len(values)
+    ext_lo = max(0, int(ext_lo))
+    ext_hi = min(n - 1, int(ext_hi))
+    core_lo = max(0, int(core_lo))
+    core_hi = min(n - 1, int(core_hi))
+
+    if side == 'left':
+        lo, hi = ext_lo, core_lo - 1
+        boundary = core_lo
+    else:
+        lo, hi = core_hi + 1, ext_hi
+        boundary = core_hi
+
+    if hi - lo + 1 < 3:
+        return None
+
+    peaks = []
     for i in range(lo + 1, hi):
         if not (np.isfinite(values[i - 1]) and np.isfinite(values[i]) and np.isfinite(values[i + 1])):
             continue
         if values[i] >= values[i - 1] and values[i] >= values[i + 1]:
-            idxs.append(i)
-    if not idxs:
-        valid = [i for i in range(lo, hi + 1) if np.isfinite(values[i])]
-        if not valid:
-            return []
-        idxs = valid
-    idxs = sorted(idxs, key=lambda i: (-values[i], abs(i - center_idx)))
-    out = []
-    seen = set()
-    for i in idxs:
-        if i not in seen:
-            seen.add(i)
-            out.append(int(i))
-        if len(out) >= max_candidates:
-            break
-    return out
+            peaks.append(i)
+
+    if not peaks:
+        return None
+
+    peaks = sorted(peaks, key=lambda i: (abs(i - boundary), -values[i]))
+    return int(peaks[0])
+
+
+def find_rim_candidates_core_then_nearest(values: np.ndarray, side: str,
+                                          core_lo: int, core_hi: int, core_center: int,
+                                          ext_lo: int, ext_hi: int,
+                                          max_candidates: int = MAX_RIM_CANDIDATES) -> List[int]:
+    """
+    规则：
+    1) 先只在当前侧 core 半边内找坑顶候选；
+    2) 当前侧 core 边界点作为第一优先候选；
+    3) 只要 core 半边内已有候选，就不再去 core 外找；
+    4) 只有 core 半边内完全没有任何候选时，才到 core 外同侧找“离 core 最近的那个峰”。
+    """
+    if side == 'left':
+        search_lo, search_hi = core_lo, core_center
+        boundary_idx = core_lo
+    else:
+        search_lo, search_hi = core_center, core_hi
+        boundary_idx = core_hi
+
+    core_candidates = find_local_peak_candidates(
+        values, search_lo, search_hi, core_center,
+        max_candidates=max_candidates,
+        priority_boundary_idx=boundary_idx,
+        side=side,
+        boundary_window=3,
+    )
+    if core_candidates:
+        return core_candidates
+
+    nearest_outside = find_nearest_peak_outside_core(values, side, core_lo, core_hi, ext_lo, ext_hi)
+    if nearest_outside is not None:
+        return [int(nearest_outside)]
+    return []
 
 
 def pit_class_by_side_len(side_len: int) -> str:
@@ -443,7 +606,7 @@ def pit_class_by_side_len(side_len: int) -> str:
     return 'large'
 
 
-def find_floor_segments(order_indices, slopes, values, slope_threshold=SLOPE_THRESHOLD):
+def find_floor_segments(order_indices, slopes, values, slope_threshold=SLOPE_THRESHOLD_DEG):
     seq = valid_sequence(order_indices, slopes, values)
     if len(seq) == 0:
         return []
@@ -470,15 +633,19 @@ def find_floor_segments(order_indices, slopes, values, slope_threshold=SLOPE_THR
             runs.append({
                 'first_idx': int(pts[0]), 'last_idx': int(pts[-1]), 'indices': pts,
                 'n': int(len(pts)), 'min': float(np.nanmin(vals)), 'mean': float(np.nanmean(vals)),
-                'median': float(np.nanmedian(vals)), 'relief': float(np.nanmax(vals)-np.nanmin(vals)),
-                'slope_mean': float(np.nanmean([slopes[p] for p in pts])), 'center_idx': int(pts[len(pts)//2]),
+                'median': float(np.nanmedian(vals)), 'relief': float(np.nanmax(vals) - np.nanmin(vals)),
+                'slope_mean': float(np.nanmean([slopes[p] for p in pts])), 'center_idx': int(pts[len(pts) // 2]),
             })
         i = max(i + 1, j)
     return runs
 
 
 def rank_floor_segments(segments: List[Dict], center_idx: int) -> List[Dict]:
-    return sorted(segments, key=lambda seg: (-int(seg['n']), abs(int(seg['center_idx'])-int(center_idx)), float(seg['median']), float(seg['relief']), float(seg['slope_mean'])))
+    return sorted(
+        segments,
+        key=lambda seg: (-int(seg['n']), abs(int(seg['center_idx']) - int(center_idx)), float(seg['median']),
+                         float(seg['relief']), float(seg['slope_mean']))
+    )
 
 
 def select_bottom_by_pit_rule(inward_order, slopes, values, core_center_idx):
@@ -487,12 +654,12 @@ def select_bottom_by_pit_rule(inward_order, slopes, values, core_center_idx):
         return None, None, None, 'no_floor_candidate', '未找到坑内有效候选点'
     side_len = len(inward_order)
     pit_class = pit_class_by_side_len(side_len)
-    floor_runs = find_floor_segments(valid, slopes, values, slope_threshold=SLOPE_THRESHOLD)
+    floor_runs = find_floor_segments(valid, slopes, values, slope_threshold=SLOPE_THRESHOLD_DEG)
     pos = {idx: i for i, idx in enumerate(inward_order)}
     if pit_class == 'small':
-        center_half = [idx for idx in valid if pos[idx] >= len(inward_order)//2]
+        center_half = [idx for idx in valid if pos[idx] >= len(inward_order) // 2]
         cand = center_half if center_half else valid
-        bottom_idx = sorted(cand, key=lambda idx: (values[idx], abs(idx-core_center_idx)))[0]
+        bottom_idx = sorted(cand, key=lambda idx: (values[idx], abs(idx - core_center_idx)))[0]
         return int(bottom_idx), float(values[bottom_idx]), 1, None, ''
     else:
         need = 2 if pit_class == 'medium' else 3
@@ -501,15 +668,21 @@ def select_bottom_by_pit_rule(inward_order, slopes, values, core_center_idx):
             qualified = rank_floor_segments(qualified, core_center_idx)
             seg = qualified[0]
             return int(seg['center_idx']), float(seg['median']), int(seg['n']), None, ''
-        center_half = [idx for idx in valid if pos[idx] >= len(inward_order)//2]
+        center_half = [idx for idx in valid if pos[idx] >= len(inward_order) // 2]
         if not center_half:
             center_half = valid
-        bottom_idx = sorted(center_half, key=lambda idx: (values[idx], abs(idx-core_center_idx)))[0]
+        bottom_idx = sorted(center_half, key=lambda idx: (values[idx], abs(idx - core_center_idx)))[0]
         return int(bottom_idx), float(values[bottom_idx]), 1, 'fallback_center_min', '坑底退化为中心半区最低点'
 
 
-def outer_orders_for_peak(peak_idx: int, logic_side: str, core_lo: int, core_hi: int, ext_lo: int, ext_hi: int):
-    if logic_side == 'left':
+def inward_order_for_peak(peak_idx: int, side: str, core_center_idx: int):
+    if side == 'left':
+        return list(range(peak_idx, core_center_idx + 1))
+    return list(range(peak_idx, core_center_idx - 1, -1))
+
+
+def outer_orders_for_peak(peak_idx: int, side: str, core_lo: int, core_hi: int, ext_lo: int, ext_hi: int):
+    if side == 'left':
         core_order = list(range(peak_idx - 1, core_lo - 1, -1))
         extend_order = list(range(core_lo - 1, ext_lo - 1, -1))
     else:
@@ -518,278 +691,390 @@ def outer_orders_for_peak(peak_idx: int, logic_side: str, core_lo: int, core_hi:
     return core_order, extend_order
 
 
-def inward_order_for_peak(peak_idx: int, logic_side: str, core_center_idx: int):
-    if logic_side == 'left':
-        return list(range(peak_idx, core_center_idx + 1))
-    return list(range(peak_idx, core_center_idx - 1, -1))
+def rank_flat_segments(segments: List[Dict], peak_idx: int):
+    return sorted(
+        segments,
+        key=lambda seg: (abs(int(seg['first_idx']) - int(peak_idx)), float(seg.get('slope_mean', np.inf)),
+                         float(seg.get('elev_std', np.inf)), float(seg.get('relief', np.inf)))
+    )
 
 
-def rank_segments(segments: List[Dict], axis_offset: int):
-    return sorted(segments, key=lambda seg: terrain_rank(seg, axis_offset))
+def classify_metrics(m: Dict) -> str:
+    if not np.isfinite(m['h1']) or m['h1'] <= 0:
+        return 'h1_le_0'
+    if not np.isfinite(m['h2']) or m['h2'] <= m['h1']:
+        return 'h2_le_h1'
+    if not np.isfinite(m['h3']) or m['h3'] <= 0:
+        return 'h3_le_0'
+    if not np.isfinite(m['h3t']) or m['h3t'] <= 0:
+        return 'h3t_le_0'
+    return 'ok'
 
 
-def build_metrics(name, profile_type, logic_side, geo_side, outer_domain,
+def add_global_idx_fields(rec: Dict, profile_type: str, expand_start_global: int, fixed_index_global: int):
+    out = dict(rec)
+    out['peak_global'] = int(expand_start_global + int(out['peak_idx'])) if np.isfinite(out.get('peak_idx', np.nan)) else np.nan
+    out['outer_first_global'] = int(expand_start_global + int(out['outer_first_idx'])) if np.isfinite(out.get('outer_first_idx', np.nan)) else np.nan
+    out['outer_last_global'] = int(expand_start_global + int(out['outer_last_idx'])) if np.isfinite(out.get('outer_last_idx', np.nan)) else np.nan
+    out['bottom_global'] = int(expand_start_global + int(out['bottom_idx'])) if np.isfinite(out.get('bottom_idx', np.nan)) else np.nan
+    if profile_type == 'row':
+        out['peak_row'] = int(fixed_index_global) if np.isfinite(out['peak_global']) else np.nan
+        out['peak_col'] = int(out['peak_global']) if np.isfinite(out['peak_global']) else np.nan
+        out['outer_first_row'] = int(fixed_index_global) if np.isfinite(out['outer_first_global']) else np.nan
+        out['outer_first_col'] = int(out['outer_first_global']) if np.isfinite(out['outer_first_global']) else np.nan
+        out['outer_last_row'] = int(fixed_index_global) if np.isfinite(out['outer_last_global']) else np.nan
+        out['outer_last_col'] = int(out['outer_last_global']) if np.isfinite(out['outer_last_global']) else np.nan
+        out['bottom_row'] = int(fixed_index_global) if np.isfinite(out['bottom_global']) else np.nan
+        out['bottom_col'] = int(out['bottom_global']) if np.isfinite(out['bottom_global']) else np.nan
+    else:
+        out['peak_row'] = int(out['peak_global']) if np.isfinite(out['peak_global']) else np.nan
+        out['peak_col'] = int(fixed_index_global) if np.isfinite(out['peak_global']) else np.nan
+        out['outer_first_row'] = int(out['outer_first_global']) if np.isfinite(out['outer_first_global']) else np.nan
+        out['outer_first_col'] = int(fixed_index_global) if np.isfinite(out['outer_first_global']) else np.nan
+        out['outer_last_row'] = int(out['outer_last_global']) if np.isfinite(out['outer_last_global']) else np.nan
+        out['outer_last_col'] = int(fixed_index_global) if np.isfinite(out['outer_last_global']) else np.nan
+        out['bottom_row'] = int(out['bottom_global']) if np.isfinite(out['bottom_global']) else np.nan
+        out['bottom_col'] = int(fixed_index_global) if np.isfinite(out['bottom_global']) else np.nan
+    return out
+
+
+def build_metrics(base_name, profile_type, side,
                   peak_idx, peak_val, outer_seg, bottom_idx, bottom_elev,
-                  axis_offset, core_center_idx, profile_rc, floor_n):
+                  line_dem_row, line_dem_col, center_row, center_col,
+                  core_start_global, core_end_global,
+                  expand_start_global, expand_end_global,
+                  width_px, height_px, diameter_px, expand_pixels):
     outer_mean = float(outer_seg['mean'])
-    outer_median = float(outer_seg['median'])
-    outer_ref = outer_median
-    h1 = float(peak_val - outer_ref)
+    h1 = float(peak_val - outer_mean)
     h2 = float(peak_val - bottom_elev)
-    h3 = float(outer_ref - bottom_elev)
+    h3 = float(outer_mean - bottom_elev)
     h3t = float((h2 - 0.2 * h1) * 0.8)
-    return {
-        'name': name, 'profile_type': profile_type, 'logic_side': logic_side, 'geo_side': geo_side,
-        'outer_domain': outer_domain, 'profile_rc': int(profile_rc), 'axis_offset': int(axis_offset),
-        'core_center_idx': int(core_center_idx), 'peak_idx': int(peak_idx),
-        'outer_first_idx': int(outer_seg['first_idx']), 'outer_last_idx': int(outer_seg['last_idx']),
-        'bottom_idx': int(bottom_idx), 'peak_val': float(peak_val), 'outer_mean': outer_mean,
-        'outer_median': outer_median, 'bottom_elev': float(bottom_elev),
-        'outer_slope_mean': float(outer_seg['slope_mean']), 'outer_elev_std': float(outer_seg['elev_std']),
-        'outer_relief': float(outer_seg['relief']), 'outer_trend': float(outer_seg.get('trend', 0.0)),
-        'outer_kind': str(outer_seg.get('kind', 'flat')),
-        'h1': h1, 'h2': h2, 'h3': h3, 'h3t': h3t, 'floor_n': int(floor_n),
+    rec = {
+        'name': base_name,
+        'profile_type': profile_type,
+        'side': side,
+        'reason': 'ok',
+        'peak_idx': int(peak_idx),
+        'outer_first_idx': int(outer_seg['first_idx']),
+        'outer_last_idx': int(outer_seg['last_idx']),
+        'bottom_idx': int(bottom_idx),
+        'peak_val': float(peak_val),
+        'outer_mean': outer_mean,
+        'bottom_elev': float(bottom_elev),
+        'h1': h1,
+        'h2': h2,
+        'h3': h3,
+        'h3t': h3t,
+        'line_dem_row': line_dem_row,
+        'line_dem_col': line_dem_col,
+        'center_row': int(center_row),
+        'center_col': int(center_col),
+        'core_start_global': int(core_start_global),
+        'core_end_global': int(core_end_global),
+        'expand_start_global': int(expand_start_global),
+        'expand_end_global': int(expand_end_global),
+        'width_px': int(width_px),
+        'height_px': int(height_px),
+        'diameter_px': int(diameter_px),
+        'expand_pixels': int(expand_pixels),
+        'outer_kind': str(outer_seg.get('kind', OUTER_REF_TYPE_STRICT_FLAT)),
+        'outer_ref_type': str(outer_seg.get('kind', OUTER_REF_TYPE_STRICT_FLAT)),
+        'outer_ref_label': (
+            'strict flat' if str(outer_seg.get('kind', OUTER_REF_TYPE_STRICT_FLAT)) == OUTER_REF_TYPE_STRICT_FLAT else
+            'V-notch low point' if str(outer_seg.get('kind', OUTER_REF_TYPE_STRICT_FLAT)) == OUTER_REF_TYPE_V_NOTCH else
+            'lowest point between peaks'
+        ),
+        'crater_type': '',
     }
+    return rec
 
 
-def is_valid_metrics(m: Dict) -> bool:
-    return np.isfinite(m['h1']) and np.isfinite(m['h2']) and np.isfinite(m['h3']) and np.isfinite(m['h3t']) and m['h1'] > 0 and m['h2'] > m['h1'] and m['h3'] > 0 and m['h3t'] > 0
+def evaluate_one_direction(arr, transform, boxes, reject_row: Dict):
+    # globals
+    core_g = boxes['core']
+    exp_g = boxes['expanded']
+    row_off = exp_g['rmin']
+    col_off = exp_g['cmin']
+    core_l = {
+        'rmin': core_g['rmin'] - row_off,
+        'rmax': core_g['rmax'] - row_off,
+        'cmin': core_g['cmin'] - col_off,
+        'cmax': core_g['cmax'] - col_off,
+    }
+    profile_type = str(reject_row['profile_type'])
+    side = str(reject_row['side'])
+    base_name = str(reject_row['name'])
+    width_px = boxes['core_w']
+    height_px = boxes['core_h']
+    diameter_px = int(max(width_px, height_px))
+    expand_pixels = int(max(boxes['expand_dx'], boxes['expand_dy']))
 
+    if profile_type == 'row':
+        fixed_global_row = int(round(float(reject_row['line_dem_row'])))
+        center_col_global = int(round(float(reject_row['center_col'])))
+        center_row_global = int(round(float(reject_row['center_row']))) if pd.notna(reject_row.get('center_row', np.nan)) else fixed_global_row
+        local_row = fixed_global_row - row_off
+        center_col_local = center_col_global - col_off
+        if not (0 <= local_row < arr.shape[0]):
+            return None, {'name': base_name, 'profile_type': profile_type, 'side': side, 'reason': 'line_out_of_window', 'crater_type': ''}
+        values = clean_profile_values(arr[local_row, :])
+        cols = np.arange(arr.shape[1])
+        rows = np.full(arr.shape[1], local_row, dtype=int)
+        lon, lat = rasterio.transform.xy(transform, rows, cols)
+        lon = np.asarray(lon, dtype=float)
+        lat = np.asarray(lat, dtype=float)
+        core_lo = core_l['cmin']
+        core_hi = core_l['cmax']
+        core_center = center_col_local
+        ext_lo = 0
+        ext_hi = arr.shape[1] - 1
+        fixed_index_global = fixed_global_row
+        line_dem_row = fixed_global_row
+        line_dem_col = np.nan
+        core_start_global = core_g['cmin']
+        core_end_global = core_g['cmax']
+        expand_start_global = exp_g['cmin']
+        expand_end_global = exp_g['cmax']
+    else:
+        fixed_global_col = int(round(float(reject_row['line_dem_col'])))
+        center_row_global = int(round(float(reject_row['center_row'])))
+        center_col_global = int(round(float(reject_row['center_col']))) if pd.notna(reject_row.get('center_col', np.nan)) else fixed_global_col
+        local_col = fixed_global_col - col_off
+        center_row_local = center_row_global - row_off
+        if not (0 <= local_col < arr.shape[1]):
+            return None, {'name': base_name, 'profile_type': profile_type, 'side': side, 'reason': 'line_out_of_window', 'crater_type': ''}
+        values = clean_profile_values(arr[:, local_col])
+        rows = np.arange(arr.shape[0])
+        cols = np.full(arr.shape[0], local_col, dtype=int)
+        lon, lat = rasterio.transform.xy(transform, rows, cols)
+        lon = np.asarray(lon, dtype=float)
+        lat = np.asarray(lat, dtype=float)
+        core_lo = core_l['rmin']
+        core_hi = core_l['rmax']
+        core_center = center_row_local
+        ext_lo = 0
+        ext_hi = arr.shape[0] - 1
+        fixed_index_global = fixed_global_col
+        line_dem_row = np.nan
+        line_dem_col = fixed_global_col
+        core_start_global = core_g['rmin']
+        core_end_global = core_g['rmax']
+        expand_start_global = exp_g['rmin']
+        expand_end_global = exp_g['rmax']
 
-def evaluate_profile_side(values, lon, lat, profile_type, logic_side, geo_side,
-                          core_lo, core_hi, core_center_idx, ext_lo, ext_hi,
-                          name, axis_offset, profile_rc):
-    values = clean_profile_values(values)
     slopes = calc_point_slopes(values, lon, lat)
-    suffix = 'Row' if profile_type == 'row' else 'Col'
-    name_out = f'{name}_DEM_{suffix}_{logic_side}'
-    if core_hi - core_lo + 1 < 3:
-        return None, {'name': name_out, 'reason': 'core_too_small', 'reason_zh': 'core范围过小', 'profile_type': profile_type, 'logic_side': logic_side, 'geo_side': geo_side, 'axis_offset': axis_offset, 'profile_rc': profile_rc}
-    peak_candidates = find_local_peak_candidates(values, core_lo, core_hi, core_center_idx, MAX_RIM_CANDIDATES)
+    peak_candidates = find_rim_candidates_core_then_nearest(values, side, core_lo, core_hi, core_center, ext_lo, ext_hi, MAX_RIM_CANDIDATES)
     if not peak_candidates:
-        return None, {'name': name_out, 'reason': 'no_rim_candidate', 'reason_zh': '未找到坑缘候选', 'profile_type': profile_type, 'logic_side': logic_side, 'geo_side': geo_side, 'axis_offset': axis_offset, 'profile_rc': profile_rc}
-    reject_snapshots = []
+        return None, {
+            'name': base_name, 'profile_type': profile_type, 'side': side, 'reason': 'no_rim_candidate',
+            'line_dem_row': line_dem_row, 'line_dem_col': line_dem_col,
+            'center_row': center_row_global, 'center_col': center_col_global,
+            'core_start_global': core_start_global, 'core_end_global': core_end_global,
+            'expand_start_global': expand_start_global, 'expand_end_global': expand_end_global,
+            'width_px': width_px, 'height_px': height_px, 'diameter_px': diameter_px, 'expand_pixels': expand_pixels,
+            'crater_type': '',
+        }
+
+    rejects = []
     for peak_idx in peak_candidates:
         peak_val = values[peak_idx]
         if not np.isfinite(peak_val):
             continue
-        inward = inward_order_for_peak(peak_idx, logic_side, core_center_idx)
+        inward = inward_order_for_peak(peak_idx, side, core_center)
         if len(inward) < 2:
             continue
-        bottom_idx, bottom_elev, floor_n, floor_reason, floor_reason_zh = select_bottom_by_pit_rule(inward, slopes, values, core_center_idx)
+        bottom_idx, bottom_elev, _, floor_reason, _ = select_bottom_by_pit_rule(inward, slopes, values, core_center)
         if bottom_idx is None or not np.isfinite(bottom_elev):
-            reject_snapshots.append({'name': name_out, 'reason': floor_reason or 'no_floor_candidate', 'reason_zh': floor_reason_zh or '未找到坑底', 'profile_type': profile_type, 'logic_side': logic_side, 'geo_side': geo_side, 'axis_offset': axis_offset, 'profile_rc': profile_rc, 'peak_idx': int(peak_idx), 'peak_val': float(peak_val)})
+            rejects.append({
+                'name': base_name, 'profile_type': profile_type, 'side': side, 'reason': floor_reason or 'no_inner_flat',
+                'line_dem_row': line_dem_row, 'line_dem_col': line_dem_col,
+                'center_row': center_row_global, 'center_col': center_col_global,
+                'core_start_global': core_start_global, 'core_end_global': core_end_global,
+                'expand_start_global': expand_start_global, 'expand_end_global': expand_end_global,
+                'width_px': width_px, 'height_px': height_px, 'diameter_px': diameter_px, 'expand_pixels': expand_pixels,
+                'crater_type': '',
+            })
             continue
 
-        core_outer_order, extend_outer_order = outer_orders_for_peak(peak_idx, logic_side, core_lo, core_hi, ext_lo, ext_hi)
+        core_outer_order, extend_outer_order = outer_orders_for_peak(peak_idx, side, core_lo, core_hi, ext_lo, ext_hi)
+
+        # 新规则：
+        # 1) 先在扩大后的 outward 范围里找严格平坦区，且平坦区最高点不能超过坑顶；
+        # 2) 若没有平坦区，但 outward 存在高于坑顶的顶点，则找离坑顶最近的 V 字拐点最低点；
+        # 3) 若没有平坦区，但 outward 存在低于坑顶的顶点，则取坑顶与该较低顶点之间的最低点。
         outer_candidates = []
-        outer_core = find_flat_segments(core_outer_order, slopes, values, max_segments=MAX_OUTER_SEGMENTS_PER_PROFILE)
-        outer_inf_core = find_outer_inflection_anchor(core_outer_order, slopes, values, max_candidates=2)
-        outer_extend = find_flat_segments(extend_outer_order, slopes, values, max_segments=MAX_OUTER_SEGMENTS_PER_PROFILE)
-        outer_inf_extend = find_outer_inflection_anchor(extend_outer_order, slopes, values, max_candidates=2)
-        outer_candidates.extend([('core', seg) for seg in rank_segments(outer_core + outer_inf_core, axis_offset)])
-        outer_candidates.extend([('extend', seg) for seg in rank_segments(outer_extend + outer_inf_extend, axis_offset)])
+        combined_order = core_outer_order + extend_outer_order
+        combined_flat = find_strict_outer_flat(combined_order, slopes, values, consecutive=3, slope_threshold=SLOPE_THRESHOLD_DEG)
+        if combined_flat is not None and np.isfinite(combined_flat.get('max', np.nan)) and combined_flat['max'] <= peak_val:
+            outer_candidates.append(combined_flat)
+        else:
+            outward_peaks = find_outward_local_peaks(combined_order, values)
+            higher_peaks = [pk for pk in outward_peaks if np.isfinite(pk.get('elev', np.nan)) and pk['elev'] > peak_val]
+            lower_peaks = [pk for pk in outward_peaks if np.isfinite(pk.get('elev', np.nan)) and pk['elev'] < peak_val]
+            if higher_peaks:
+                v_candidates = find_outer_v_notches(combined_order, values)
+                v_candidates = [seg for seg in v_candidates if max(seg.get('left_peak_elev', -np.inf), seg.get('right_peak_elev', -np.inf)) > peak_val]
+                outer_candidates.extend(v_candidates)
+            if not outer_candidates and lower_peaks:
+                nearest_lower_peak = sorted(lower_peaks, key=lambda pk: pk['near_rank'])[0]
+                low_seg = build_lowest_point_between_peaks(peak_idx, nearest_lower_peak['idx'], values)
+                if low_seg is not None and np.isfinite(low_seg.get('mean', np.nan)):
+                    outer_candidates.append(low_seg)
+
         if not outer_candidates:
-            reject_snapshots.append({'name': name_out, 'reason': 'no_outer_flat', 'reason_zh': '未找到坑外平缓区', 'profile_type': profile_type, 'logic_side': logic_side, 'geo_side': geo_side, 'axis_offset': axis_offset, 'profile_rc': profile_rc, 'peak_idx': int(peak_idx), 'peak_val': float(peak_val), 'bottom_idx': int(bottom_idx), 'bottom_elev': float(bottom_elev), 'floor_n': int(floor_n)})
+            rejects.append({
+                'name': base_name, 'profile_type': profile_type, 'side': side, 'reason': 'no_outer_flat',
+                'peak_idx': int(peak_idx), 'peak_val': float(peak_val),
+                'bottom_idx': int(bottom_idx), 'bottom_elev': float(bottom_elev),
+                'line_dem_row': line_dem_row, 'line_dem_col': line_dem_col,
+                'center_row': center_row_global, 'center_col': center_col_global,
+                'core_start_global': core_start_global, 'core_end_global': core_end_global,
+                'expand_start_global': expand_start_global, 'expand_end_global': expand_end_global,
+                'width_px': width_px, 'height_px': height_px, 'diameter_px': diameter_px, 'expand_pixels': expand_pixels,
+                'crater_type': '',
+            })
             continue
-        for outer_domain, outer_seg in outer_candidates:
-            m = build_metrics(name_out, profile_type, logic_side, geo_side, outer_domain, peak_idx, float(peak_val), outer_seg, bottom_idx, float(bottom_elev), axis_offset, core_center_idx, profile_rc, floor_n)
-            # light physical preference: try more plausible combinations first, but do not hard reject too early
-            if is_valid_metrics(m):
-                m['reason'] = 'ok'; m['reason_zh'] = ''
-                return m, None
-            if not np.isfinite(m['h1']) or m['h1'] <= 0:
-                reason = 'h1_le_0'; reason_zh = 'h1小于等于0'
-            elif not np.isfinite(m['h2']) or m['h2'] <= m['h1']:
-                reason = 'h2_le_h1'; reason_zh = 'h2小于等于h1'
-            elif not np.isfinite(m['h3']) or m['h3'] <= 0:
-                reason = 'h3_le_0'; reason_zh = 'h3小于等于0'
-            elif not np.isfinite(m['h3t']) or m['h3t'] <= 0:
-                reason = 'h3t_le_0'; reason_zh = 'h3t小于等于0'
-            else:
-                reason = 'invalid_geometry'; reason_zh = '几何关系不满足'
-            m['reason'] = reason; m['reason_zh'] = reason_zh
-            reject_snapshots.append(m)
-    if reject_snapshots:
-        priority = {'h2_le_h1': 0, 'h1_le_0': 1, 'no_outer_flat': 2, 'no_floor_candidate': 3, 'invalid_geometry': 4}
-        reject_snapshots.sort(key=lambda d: (priority.get(d.get('reason', 'invalid_geometry'), 99), abs(d.get('axis_offset', 999)), abs(d.get('profile_rc', 999)-d.get('core_center_idx', d.get('profile_rc', 999))), 0 if d.get('outer_kind')=='flat' else 1))
-        return None, reject_snapshots[0]
-    return None, {'name': name_out, 'reason': 'no_valid_combination', 'reason_zh': '未找到有效组合', 'profile_type': profile_type, 'logic_side': logic_side, 'geo_side': geo_side, 'axis_offset': axis_offset, 'profile_rc': profile_rc}
+
+        if any(seg.get('kind') == OUTER_REF_TYPE_STRICT_FLAT for seg in outer_candidates):
+            outer_candidates = rank_flat_segments([seg for seg in outer_candidates if seg.get('kind') == OUTER_REF_TYPE_STRICT_FLAT], peak_idx)
+        else:
+            outer_candidates = sorted(outer_candidates, key=lambda seg: (seg.get('near_rank', np.inf), -seg.get('relief', 0.0)))
+
+        for outer_seg in outer_candidates:
+            rec = build_metrics(
+                base_name, profile_type, side, peak_idx, float(peak_val), outer_seg, bottom_idx, float(bottom_elev),
+                line_dem_row, line_dem_col, center_row_global, center_col_global,
+                core_start_global, core_end_global,
+                expand_start_global, expand_end_global,
+                width_px, height_px, diameter_px, expand_pixels,
+            )
+            rec['reason'] = classify_metrics(rec)
+            rec = add_global_idx_fields(rec, profile_type, expand_start_global, fixed_index_global)
+            if rec['reason'] == 'ok':
+                return rec, None
+            rejects.append(rec)
+
+    if rejects:
+        priority = {'h2_le_h1': 0, 'h1_le_0': 1, 'no_outer_flat': 2, 'no_inner_flat': 3, 'no_valid_combination': 4}
+        rejects.sort(key=lambda d: (priority.get(d.get('reason', 'no_valid_combination'), 99), 0 if d.get('outer_kind') == 'strict_flat' else 1))
+        return None, rejects[0]
+
+    return None, {
+        'name': base_name, 'profile_type': profile_type, 'side': side, 'reason': 'no_valid_combination',
+        'line_dem_row': line_dem_row, 'line_dem_col': line_dem_col,
+        'center_row': center_row_global, 'center_col': center_col_global,
+        'core_start_global': core_start_global, 'core_end_global': core_end_global,
+        'expand_start_global': expand_start_global, 'expand_end_global': expand_end_global,
+        'width_px': width_px, 'height_px': height_px, 'diameter_px': diameter_px, 'expand_pixels': expand_pixels,
+        'crater_type': '',
+    }
 
 
-def evaluate_row_cluster(data, transform, boxes_local, base_name):
-    core = boxes_local['core']; expanded = boxes_local['expanded']
-    nrows, ncols = data.shape
-    refined_rows, refined_cols = refine_center_indices(data, core)
-    center_row_candidates = refined_rows
-    center_col_candidates = refined_cols
-    rows = candidate_rows(core['rmin'], core['rmax'], preferred_centers=refined_rows)
-    scored_rows = []
-    for r in rows:
-        if not (0 <= r < nrows):
-            continue
-        values = clean_profile_values(data[r, :])
-        lon, lat = build_profile_coords_row(transform, ncols, r)
-        slopes = calc_point_slopes(values, lon, lat)
-        score = profile_floor_score(values, slopes, core['cmin'], core['cmax'])
-        scored_rows.append((score, r))
-    scored_rows.sort(key=lambda x: x[0])
-    valid, reject = [], []
-    for score, r in scored_rows:
-        values = data[r, :]; lon, lat = build_profile_coords_row(transform, ncols, r)
-        axis_offset = min(abs(r-c) for c in center_row_candidates)
-        for center_col in center_col_candidates:
-            v_left, rej_left = evaluate_profile_side(values, lon, lat, 'row', 'left', 'west', core['cmin'], center_col, center_col, expanded['cmin'], expanded['cmax'], base_name, axis_offset, r)
-            if v_left is not None:
-                v_left['chosen_center_col'] = center_col; v_left['floor_score'] = score; valid.append(v_left)
-            elif rej_left is not None:
-                rej_left['chosen_center_col'] = center_col; rej_left['floor_score'] = score; reject.append(rej_left)
-            v_right, rej_right = evaluate_profile_side(values, lon, lat, 'row', 'right', 'east', center_col, core['cmax'], center_col, expanded['cmin'], expanded['cmax'], base_name, axis_offset, r)
-            if v_right is not None:
-                v_right['chosen_center_col'] = center_col; v_right['floor_score'] = score; valid.append(v_right)
-            elif rej_right is not None:
-                rej_right['chosen_center_col'] = center_col; rej_right['floor_score'] = score; reject.append(rej_right)
-    return valid, reject
-
-
-def evaluate_col_cluster(data, transform, boxes_local, base_name):
-    core = boxes_local['core']; expanded = boxes_local['expanded']
-    nrows, ncols = data.shape
-    refined_rows, refined_cols = refine_center_indices(data, core)
-    center_row_candidates = refined_rows
-    center_col_candidates = refined_cols
-    cols = candidate_cols(core['cmin'], core['cmax'], preferred_centers=refined_cols)
-    scored_cols = []
-    for c in cols:
-        if not (0 <= c < ncols):
-            continue
-        values = clean_profile_values(data[:, c])
-        lon, lat = build_profile_coords_col(transform, nrows, c)
-        slopes = calc_point_slopes(values, lon, lat)
-        score = profile_floor_score(values, slopes, core['rmin'], core['rmax'])
-        scored_cols.append((score, c))
-    scored_cols.sort(key=lambda x: x[0])
-    valid, reject = [], []
-    for score, c in scored_cols:
-        values = data[:, c]; lon, lat = build_profile_coords_col(transform, nrows, c)
-        axis_offset = min(abs(c-cc) for cc in center_col_candidates)
-        for center_row in center_row_candidates:
-            v_left, rej_left = evaluate_profile_side(values, lon, lat, 'col', 'left', 'north', core['rmin'], center_row, center_row, expanded['rmin'], expanded['rmax'], base_name, axis_offset, c)
-            if v_left is not None:
-                v_left['chosen_center_row'] = center_row; v_left['floor_score'] = score; valid.append(v_left)
-            elif rej_left is not None:
-                rej_left['chosen_center_row'] = center_row; rej_left['floor_score'] = score; reject.append(rej_left)
-            v_right, rej_right = evaluate_profile_side(values, lon, lat, 'col', 'right', 'south', center_row, core['rmax'], center_row, expanded['rmin'], expanded['rmax'], base_name, axis_offset, c)
-            if v_right is not None:
-                v_right['chosen_center_row'] = center_row; v_right['floor_score'] = score; valid.append(v_right)
-            elif rej_right is not None:
-                rej_right['chosen_center_row'] = center_row; rej_right['floor_score'] = score; reject.append(rej_right)
-    return valid, reject
-
-
-def best_result_by_name(results: List[Dict], profile_type: str, logic_side: str):
-    subset = [r for r in results if r['profile_type'] == profile_type and r['logic_side'] == logic_side]
-    if not subset:
-        return None
-    domain_priority = {'core': 0, 'extend': 1}
-    subset.sort(key=lambda r: (domain_priority.get(r.get('outer_domain', 'extend'), 99), abs(r.get('axis_offset', 0)), 0 if r.get('outer_kind') == 'flat' else 1, -r.get('h3', -np.inf), r.get('outer_slope_mean', np.inf), r.get('outer_elev_std', np.inf), r.get('outer_relief', np.inf)))
-    return subset[0]
-
-
-def best_reject_by_name(rejects: List[Dict], profile_type: str, logic_side: str):
-    subset = [r for r in rejects if r.get('profile_type') == profile_type and r.get('logic_side') == logic_side]
-    if not subset:
-        return None
-    priority = {'no_outer_flat': 0, 'h2_le_h1': 1, 'h1_le_0': 2, 'no_floor_candidate': 3, 'no_valid_combination': 4}
-    subset.sort(key=lambda r: (priority.get(r.get('reason', 'no_valid_combination'), 99), abs(r.get('axis_offset', 999)), abs(r.get('profile_rc', 999)-r.get('core_center_idx', r.get('profile_rc', 999))), 0 if r.get('outer_kind') == 'flat' else 1))
-    return subset[0]
-
-
-def draw_show_figure(show_png: Path, arr: np.ndarray, boxes_local: Dict, row_rec: Optional[Dict], col_rec: Optional[Dict], base_name: str):
-    core = boxes_local['core']; expanded = boxes_local['expanded']
+def draw_show_figure(show_png: Path, arr: np.ndarray, boxes_local: Dict,
+                     row_rec: Optional[Dict], col_rec: Optional[Dict], base_name: str):
+    core = boxes_local['core']
+    expanded = boxes_local['expanded']
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
     ax = axes[0]
     img = np.array(arr, dtype=float)
     finite = np.isfinite(img)
     if np.any(finite):
-        vmin = float(np.nanpercentile(img[finite], 5)); vmax = float(np.nanpercentile(img[finite], 95))
+        vmin = float(np.nanpercentile(img[finite], 5))
+        vmax = float(np.nanpercentile(img[finite], 95))
         ax.imshow(img, cmap='gray', origin='upper', vmin=vmin, vmax=vmax)
     else:
         ax.imshow(np.zeros_like(img), cmap='gray', origin='upper')
-    ax.plot([core['cmin'], core['cmax'], core['cmax'], core['cmin'], core['cmin']], [core['rmin'], core['rmin'], core['rmax'], core['rmax'], core['rmin']], color='b', lw=1.6)
-    ax.plot([expanded['cmin'], expanded['cmax'], expanded['cmax'], expanded['cmin'], expanded['cmin']], [expanded['rmin'], expanded['rmin'], expanded['rmax'], expanded['rmax'], expanded['rmin']], color='g', lw=1.2)
-    # row line yellow, col line cyan to match your recent figures
-    if row_rec is not None and np.isfinite(row_rec.get('profile_rc', np.nan)):
-        rr = int(row_rec['profile_rc']); ax.axhline(rr, color='y', lw=1.0)
-        if np.isfinite(row_rec.get('peak_idx', np.nan)): ax.scatter([int(row_rec['peak_idx'])], [rr], c='r', s=40)
-        if np.isfinite(row_rec.get('bottom_idx', np.nan)): ax.scatter([int(row_rec['bottom_idx'])], [rr], c='orange', s=40)
-        if np.isfinite(row_rec.get('outer_first_idx', np.nan)) and np.isfinite(row_rec.get('outer_last_idx', np.nan)):
-            ax.plot([int(row_rec['outer_first_idx']), int(row_rec['outer_last_idx'])], [rr, rr], color='lime', lw=3)
-    if col_rec is not None and np.isfinite(col_rec.get('profile_rc', np.nan)):
-        cc = int(col_rec['profile_rc']); ax.axvline(cc, color='c', lw=1.0)
-        if np.isfinite(col_rec.get('peak_idx', np.nan)): ax.scatter([cc], [int(col_rec['peak_idx'])], c='r', s=40)
-        if np.isfinite(col_rec.get('bottom_idx', np.nan)): ax.scatter([cc], [int(col_rec['bottom_idx'])], c='orange', s=40)
-        if np.isfinite(col_rec.get('outer_first_idx', np.nan)) and np.isfinite(col_rec.get('outer_last_idx', np.nan)):
-            ax.plot([cc, cc], [int(col_rec['outer_first_idx']), int(col_rec['outer_last_idx'])], color='lime', lw=3)
+    ax.plot([core['cmin'], core['cmax'], core['cmax'], core['cmin'], core['cmin']],
+            [core['rmin'], core['rmin'], core['rmax'], core['rmax'], core['rmin']], color='b', lw=1.6)
+    ax.plot([expanded['cmin'], expanded['cmax'], expanded['cmax'], expanded['cmin'], expanded['cmin']],
+            [expanded['rmin'], expanded['rmin'], expanded['rmax'], expanded['rmax'], expanded['rmin']], color='g', lw=1.2)
+    if row_rec is not None and np.isfinite(row_rec.get('line_dem_row', np.nan)):
+        ax.axhline(int(row_rec['line_dem_row']) - boxes_local['row_off'], color='y', lw=1.0)
+    if col_rec is not None and np.isfinite(col_rec.get('line_dem_col', np.nan)):
+        ax.axvline(int(col_rec['line_dem_col']) - boxes_local['col_off'], color='c', lw=1.0)
     ax.set_title(base_name)
+
     axr = axes[1]
-    if row_rec is not None and np.isfinite(row_rec.get('profile_rc', np.nan)):
-        rr = int(row_rec['profile_rc']); vals = arr[rr, :]; x = np.arange(len(vals))
+    if row_rec is not None and np.isfinite(row_rec.get('line_dem_row', np.nan)):
+        rr_local = int(row_rec['line_dem_row']) - boxes_local['row_off']
+        vals = arr[rr_local, :]
+        x = np.arange(len(vals)) + boxes_local['col_off']
         axr.plot(x, vals, 'k-', lw=1.5)
-        axr.axvspan(core['cmin'], core['cmax'], color='royalblue', alpha=0.15)
-        axr.axvspan(expanded['cmin'], expanded['cmax'], color='green', alpha=0.05)
-        if np.isfinite(row_rec.get('peak_idx', np.nan)): axr.scatter([int(row_rec['peak_idx'])], [vals[int(row_rec['peak_idx'])]], c='r', s=60)
-        if np.isfinite(row_rec.get('bottom_idx', np.nan)): axr.scatter([int(row_rec['bottom_idx'])], [vals[int(row_rec['bottom_idx'])]], c='orange', s=60)
-        if np.isfinite(row_rec.get('outer_first_idx', np.nan)) and np.isfinite(row_rec.get('outer_last_idx', np.nan)):
-            segx = np.arange(int(row_rec['outer_first_idx']), int(row_rec['outer_last_idx']) + 1)
-            axr.plot(segx, vals[segx], color='lime', lw=3)
-        axr.set_title(f"Row ({row_rec.get('logic_side','')}, {row_rec.get('reason','')})")
-    else:
-        axr.set_title('Row')
+        axr.axvspan(row_rec['core_start_global'], row_rec['core_end_global'], color='royalblue', alpha=0.15)
+        axr.axvspan(row_rec['expand_start_global'], row_rec['expand_end_global'], color='green', alpha=0.05)
+        if np.isfinite(row_rec.get('peak_global', np.nan)):
+            axr.scatter([row_rec['peak_global']], [row_rec['peak_val']], c='r', s=60)
+        if np.isfinite(row_rec.get('bottom_global', np.nan)):
+            axr.scatter([row_rec['bottom_global']], [row_rec['bottom_elev']], c='orange', s=60)
+        if np.isfinite(row_rec.get('outer_first_global', np.nan)) and np.isfinite(row_rec.get('outer_last_global', np.nan)):
+            x1 = int(row_rec['outer_first_global']); x2 = int(row_rec['outer_last_global'])
+            axr.plot(np.arange(x1, x2 + 1), vals[int(x1 - boxes_local['col_off']):int(x2 - boxes_local['col_off']) + 1], color='lime', lw=3)
+        axr.set_title(f"Row ({row_rec.get('side','')}, {row_rec.get('reason','')}, {row_rec.get('outer_ref_type','')})")
+
     axc = axes[2]
-    if col_rec is not None and np.isfinite(col_rec.get('profile_rc', np.nan)):
-        cc = int(col_rec['profile_rc']); vals = arr[:, cc]; y = np.arange(len(vals))
+    if col_rec is not None and np.isfinite(col_rec.get('line_dem_col', np.nan)):
+        cc_local = int(col_rec['line_dem_col']) - boxes_local['col_off']
+        vals = arr[:, cc_local]
+        y = np.arange(len(vals)) + boxes_local['row_off']
         axc.plot(y, vals, 'k-', lw=1.5)
-        axc.axvspan(core['rmin'], core['rmax'], color='royalblue', alpha=0.15)
-        axc.axvspan(expanded['rmin'], expanded['rmax'], color='green', alpha=0.05)
-        if np.isfinite(col_rec.get('peak_idx', np.nan)): axc.scatter([int(col_rec['peak_idx'])], [vals[int(col_rec['peak_idx'])]], c='r', s=60)
-        if np.isfinite(col_rec.get('bottom_idx', np.nan)): axc.scatter([int(col_rec['bottom_idx'])], [vals[int(col_rec['bottom_idx'])]], c='orange', s=60)
-        if np.isfinite(col_rec.get('outer_first_idx', np.nan)) and np.isfinite(col_rec.get('outer_last_idx', np.nan)):
-            segx = np.arange(int(col_rec['outer_first_idx']), int(col_rec['outer_last_idx']) + 1)
-            axc.plot(segx, vals[segx], color='lime', lw=3)
-        axc.set_title(f"Col ({col_rec.get('logic_side','')}, {col_rec.get('reason','')})")
-    else:
-        axc.set_title('Col')
-    plt.tight_layout(); show_png.parent.mkdir(parents=True, exist_ok=True); plt.savefig(show_png, dpi=180); plt.close(fig)
+        axc.axvspan(col_rec['core_start_global'], col_rec['core_end_global'], color='royalblue', alpha=0.15)
+        axc.axvspan(col_rec['expand_start_global'], col_rec['expand_end_global'], color='green', alpha=0.05)
+        if np.isfinite(col_rec.get('peak_global', np.nan)):
+            axc.scatter([col_rec['peak_global']], [col_rec['peak_val']], c='r', s=60)
+        if np.isfinite(col_rec.get('bottom_global', np.nan)):
+            axc.scatter([col_rec['bottom_global']], [col_rec['bottom_elev']], c='orange', s=60)
+        if np.isfinite(col_rec.get('outer_first_global', np.nan)) and np.isfinite(col_rec.get('outer_last_global', np.nan)):
+            y1 = int(col_rec['outer_first_global']); y2 = int(col_rec['outer_last_global'])
+            axc.plot(np.arange(y1, y2 + 1), vals[int(y1 - boxes_local['row_off']):int(y2 - boxes_local['row_off']) + 1], color='lime', lw=3)
+        axc.set_title(f"Col ({col_rec.get('side','')}, {col_rec.get('reason','')}, {col_rec.get('outer_ref_type','')})")
+
+    plt.tight_layout()
+    show_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(show_png, dpi=FIG_DPI)
+    plt.close(fig)
 
 
-def process_feature(src, geom, base_name: str, show_dir: Path):
+def process_one_feature(src, geom, base_name: str, reject_rows: pd.DataFrame, output_dir: Path):
     rmin, rmax, cmin, cmax = geom_bounds_to_rc(src, geom)
     boxes = make_boxes_from_original(rmin, rmax, cmin, cmax, src)
     arr, transform = read_window(src, boxes['expanded']['rmin'], boxes['expanded']['rmax'], boxes['expanded']['cmin'], boxes['expanded']['cmax'])
-    row_off = boxes['expanded']['rmin']; col_off = boxes['expanded']['cmin']
+    row_off = boxes['expanded']['rmin']
+    col_off = boxes['expanded']['cmin']
     boxes_local = {
-        'core': {'rmin': boxes['core']['rmin'] - row_off, 'rmax': boxes['core']['rmax'] - row_off, 'cmin': boxes['core']['cmin'] - col_off, 'cmax': boxes['core']['cmax'] - col_off},
-        'expanded': {'rmin': 0, 'rmax': arr.shape[0]-1, 'cmin': 0, 'cmax': arr.shape[1]-1},
+        'core': {
+            'rmin': boxes['core']['rmin'] - row_off,
+            'rmax': boxes['core']['rmax'] - row_off,
+            'cmin': boxes['core']['cmin'] - col_off,
+            'cmax': boxes['core']['cmax'] - col_off,
+        },
+        'expanded': {'rmin': 0, 'rmax': arr.shape[0] - 1, 'cmin': 0, 'cmax': arr.shape[1] - 1},
+        'row_off': row_off,
+        'col_off': col_off,
     }
-    row_valid, row_reject = evaluate_row_cluster(arr, transform, boxes_local, base_name)
-    col_valid, col_reject = evaluate_col_cluster(arr, transform, boxes_local, base_name)
-    all_valid = row_valid + col_valid
-    all_reject = row_reject + col_reject
-    valid_records, reject_records, chosen_map = [], [], {}
-    for profile_type, logic_side in [('row','left'), ('row','right'), ('col','left'), ('col','right')]:
-        best_v = best_result_by_name(all_valid, profile_type, logic_side)
-        if best_v is not None:
-            valid_records.append(best_v); chosen_map[(profile_type, logic_side)] = best_v
+
+    valid_records = []
+    reject_records = []
+    row_plot = None
+    col_plot = None
+
+    # one record per rejected direction
+    dedup = reject_rows.drop_duplicates(subset=['name', 'profile_type', 'side'], keep='first')
+    for _, rec in dedup.iterrows():
+        valid_rec, reject_rec = evaluate_one_direction(arr, transform, boxes, rec)
+        if valid_rec is not None:
+            valid_records.append(valid_rec)
+            chosen = valid_rec
         else:
-            best_r = best_reject_by_name(all_reject, profile_type, logic_side)
-            if best_r is None:
-                suffix = 'Row' if profile_type == 'row' else 'Col'
-                best_r = {'name': f'{base_name}_DEM_{suffix}_{logic_side}', 'reason': 'no_valid_result', 'reason_zh': '未找到有效结果', 'profile_type': profile_type, 'logic_side': logic_side}
-            reject_records.append(best_r); chosen_map[(profile_type, logic_side)] = best_r
-    row_rec = chosen_map.get(('row','right')) or chosen_map.get(('row','left'))
-    col_rec = chosen_map.get(('col','right')) or chosen_map.get(('col','left'))
-    draw_show_figure(show_dir / f'{base_name}_show.png', arr, boxes_local, row_rec, col_rec, base_name)
+            reject_records.append(reject_rec)
+            chosen = reject_rec
+        if rec['profile_type'] == 'row' and row_plot is None:
+            row_plot = chosen
+        if rec['profile_type'] == 'col' and col_plot is None:
+            col_plot = chosen
+
+    if row_plot is not None or col_plot is not None:
+        draw_show_figure(output_dir / PLOT_DIRNAME / f'{base_name}_show.png', arr, boxes_local, row_plot, col_plot, base_name)
+
     out_geoms = {
         'expanded_geom': rc_box_to_geom(src, boxes['expanded']['rmin'], boxes['expanded']['rmax'], boxes['expanded']['cmin'], boxes['expanded']['cmax']),
         'core_geom': rc_box_to_geom(src, boxes['core']['rmin'], boxes['core']['rmax'], boxes['core']['cmin'], boxes['core']['cmax']),
@@ -797,39 +1082,82 @@ def process_feature(src, geom, base_name: str, show_dir: Path):
     return valid_records, reject_records, out_geoms
 
 
-def run(dem_path: Path, shp_path: Path, output_dir: Path, output_tag: str = OUTPUT_TAG):
+def run(dem_path: Path, shp_path: Path, step1_reject_csv: Path, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
-    show_dir = output_dir / SHOW_DIRNAME
     if not dem_path.exists():
         raise FileNotFoundError(f'未找到 DEM：{dem_path}')
     if not shp_path.exists():
         raise FileNotFoundError(f'未找到 SHP：{shp_path}')
-    gdf = gpd.read_file(shp_path)
-    field_name = infer_name_field(gdf)
-    valid_records, reject_records, expanded_geoms, core_geoms = [], [], [], []
+    if not step1_reject_csv.exists():
+        raise FileNotFoundError(f'未找到 step1 reject CSV：{step1_reject_csv}')
+
+    step1_reject = pd.read_csv(step1_reject_csv, encoding='utf-8-sig')
+    required_cols = ['name', 'profile_type', 'side']
+    for c in required_cols:
+        if c not in step1_reject.columns:
+            raise ValueError(f'step1 reject CSV 缺少必需列：{c}')
+
+    # 只保留四个方向记录
+    step1_reject = step1_reject[step1_reject['profile_type'].isin(['row', 'col']) & step1_reject['side'].isin(['left', 'right'])].copy()
+    step1_reject['name'] = step1_reject['name'].astype(str)
+
+    valid_records = []
+    reject_records = []
+    expanded_geoms = []
+    core_geoms = []
+
     with rasterio.open(dem_path) as src:
+        gdf = gpd.read_file(shp_path)
+        gdf, work_crs = harmonize_vector_raster_crs(gdf, src)
+        field_name = infer_name_field(gdf)
+        shp_name_to_geom = {}
         for idx, row in gdf.iterrows():
             geom = row.geometry
             if geom is None or geom.is_empty:
                 continue
             base_name = safe_feature_name(row, field_name, idx)
+            shp_name_to_geom[base_name] = geom
+
+        grouped = step1_reject.groupby('name', sort=True)
+        for base_name, subdf in grouped:
+            geom = shp_name_to_geom.get(str(base_name))
+            if geom is None:
+                for _, rec in subdf.iterrows():
+                    reject_records.append({
+                        'name': str(base_name), 'profile_type': rec['profile_type'], 'side': rec['side'],
+                        'reason': 'name_not_found_in_shp', 'crater_type': ''
+                    })
+                continue
             try:
-                valid_i, reject_i, out_geoms = process_feature(src, geom, base_name, show_dir)
-                valid_records.extend(valid_i); reject_records.extend(reject_i)
-                expanded_geoms.append({'name': base_name, 'geometry': out_geoms['expanded_geom']})
-                core_geoms.append({'name': base_name, 'geometry': out_geoms['core_geom']})
+                valid_i, reject_i, out_geoms = process_one_feature(src, geom, str(base_name), subdf, output_dir)
+                valid_records.extend(valid_i)
+                reject_records.extend(reject_i)
+                expanded_geoms.append({'name': str(base_name), 'geometry': out_geoms['expanded_geom']})
+                core_geoms.append({'name': str(base_name), 'geometry': out_geoms['core_geom']})
             except Exception as e:
-                for profile_type, logic_side in [('row','left'), ('row','right'), ('col','left'), ('col','right')]:
-                    suffix = 'Row' if profile_type == 'row' else 'Col'
-                    reject_records.append({'name': f'{base_name}_DEM_{suffix}_{logic_side}', 'reason': f'exception: {e}', 'reason_zh': '程序异常', 'profile_type': profile_type, 'logic_side': logic_side})
+                for _, rec in subdf.iterrows():
+                    reject_records.append({
+                        'name': str(base_name), 'profile_type': rec['profile_type'], 'side': rec['side'],
+                        'reason': f'exception: {e}', 'crater_type': ''
+                    })
+
     valid_cols = [
-        'name','profile_type','logic_side','geo_side','outer_domain','profile_rc','axis_offset',
-        'chosen_center_row','chosen_center_col','floor_score','core_center_idx',
-        'peak_idx','outer_first_idx','outer_last_idx','bottom_idx','peak_val',
-        'outer_mean','outer_median','bottom_elev','outer_slope_mean','outer_elev_std','outer_relief','outer_trend','outer_kind',
-        'h1','h2','h3','h3t','floor_n','reason','reason_zh'
+        'name', 'profile_type', 'side', 'reason',
+        'peak_val', 'outer_mean', 'bottom_elev',
+        'h1', 'h2', 'h3', 'h3t', 'crater_type',
+        'line_dem_row', 'line_dem_col',
+        'center_row', 'center_col',
+        'core_start_global', 'core_end_global',
+        'expand_start_global', 'expand_end_global',
+        'peak_idx', 'peak_global', 'peak_row', 'peak_col',
+        'outer_first_idx', 'outer_last_idx',
+        'outer_first_global', 'outer_first_row', 'outer_first_col',
+        'outer_last_global', 'outer_last_row', 'outer_last_col',
+        'bottom_idx', 'bottom_global', 'bottom_row', 'bottom_col',
+        'width_px', 'height_px', 'diameter_px', 'expand_pixels', 'outer_kind', 'outer_ref_type', 'outer_ref_label'
     ]
     reject_cols = valid_cols
+
     valid_df = pd.DataFrame(valid_records)
     reject_df = pd.DataFrame(reject_records)
     for c in valid_cols:
@@ -839,36 +1167,34 @@ def run(dem_path: Path, shp_path: Path, output_dir: Path, output_tag: str = OUTP
             reject_df[c] = np.nan
     valid_df = valid_df[valid_cols]
     reject_df = reject_df[reject_cols]
-    out_csv = output_dir / f'all_{output_tag}_h123.csv'
-    out_reject_csv = output_dir / f'all_{output_tag}_h123_reject.csv'
+
+    out_csv = output_dir / VALID_CSV_NAME
+    out_reject_csv = output_dir / REJECT_CSV_NAME
     valid_df.to_csv(out_csv, index=False, encoding='utf-8-sig')
     reject_df.to_csv(out_reject_csv, index=False, encoding='utf-8-sig')
-    shp_crs = gdf.crs
-    gpd.GeoDataFrame(expanded_geoms, crs=shp_crs).to_file(output_dir / f'{output_tag}_expanded.shp', driver='ESRI Shapefile')
-    gpd.GeoDataFrame(core_geoms, crs=shp_crs).to_file(output_dir / f'{output_tag}_core.shp', driver='ESRI Shapefile')
+
+    gpd.GeoDataFrame(core_geoms, geometry='geometry', crs=work_crs).to_file(output_dir / CORE_SHP_NAME, driver='ESRI Shapefile', encoding='utf-8')
+    gpd.GeoDataFrame(expanded_geoms, geometry='geometry', crs=work_crs).to_file(output_dir / EXPAND_SHP_NAME, driver='ESRI Shapefile', encoding='utf-8')
+
     print(f'DEM 路径      : {dem_path}')
     print(f'SHP 路径      : {shp_path}')
+    print(f'step1 reject  : {step1_reject_csv}')
     print(f'输出目录      : {output_dir}')
     print(f'有效结果 CSV  : {out_csv}')
     print(f'剔除结果 CSV  : {out_reject_csv}')
-    print(f'扩大后 SHP    : {output_dir / f"{output_tag}_expanded.shp"}')
-    print(f'core 调试 SHP : {output_dir / f"{output_tag}_core.shp"}')
-    print(f'show 目录     : {show_dir}')
+    print(f'core SHP      : {output_dir / CORE_SHP_NAME}')
+    print(f'expanded SHP  : {output_dir / EXPAND_SHP_NAME}')
+    print(f'plots 目录    : {output_dir / PLOT_DIRNAME}')
+    print(f'处理方向数    : {len(valid_df) + len(reject_df)}')
     print(f'通过记录数    : {len(valid_df)}')
     print(f'剔除记录数    : {len(reject_df)}')
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="一体化 ExtendCalculateH123：输入 shp + DEM，core 保持原 shp，outer flat 先 core 后 extend，再计算 h1/h2/h3")
-    parser.add_argument("-dir", "--dir", "--shp", dest="shp", default=str(DEFAULT_SHP_PATH), help="SHP 路径")
-    parser.add_argument("-dem", "--dem", dest="dem", default=str(DEFAULT_DEM_PATH), help="DEM 路径")
-    parser.add_argument("-out", "--out", "--output-dir", dest="output_dir", default=str(DEFAULT_OUTPUT_DIR), help="输出目录")
-    parser.add_argument("-tag", "--tag", dest="tag", default=OUTPUT_TAG, help="输出文件名前缀标签，例如 yolo")
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='ExtendCalculateH123 step2：只读取 step1 reject 的方向，保留原 Extend core/扩大算法，outer 仅允许 平坦区 or V型最低点')
+    parser.add_argument('--dem', default=str(DEFAULT_DEM_PATH), help='DEM 路径')
+    parser.add_argument('--shp', default=str(DEFAULT_SHP_PATH), help='SHP 路径')
+    parser.add_argument('--step1-reject', default=str(DEFAULT_STEP1_REJECT_CSV), help='step1 的 reject CSV 路径')
+    parser.add_argument('--out', default=str(DEFAULT_OUTPUT_DIR), help='输出目录')
     args = parser.parse_args()
-
-    run(
-        dem_path=Path(args.dem),
-        shp_path=Path(args.shp),
-        output_dir=Path(args.output_dir),
-        output_tag=args.tag,
-    )
+    run(Path(args.dem), Path(args.shp), Path(args.step1_reject), Path(args.out))
