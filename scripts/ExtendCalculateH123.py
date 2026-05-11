@@ -18,6 +18,7 @@ import matplotlib.pyplot as plt
 # Easy-to-edit input/output paths
 # =========================
 DEFAULT_DEM_PATH = Path(r"Database\CE5\CE5_dem.tif")
+DEFAULT_CF_PATH = Path(r"Database\CE5\CE5_CF.tif")
 DEFAULT_SHP_PATH = Path(r"Database/CE5/exce5/yolo_ce5.shp")
 DEFAULT_STEP1_REJECT_CSV = Path(r"Database\CE5\yolo\chickin\step1\all_yolo_h123_reject.csv")
 DEFAULT_OUTPUT_DIR = Path(r"Database\CE5\yolo\chickin\step2")
@@ -26,6 +27,25 @@ CORE_SHP_NAME = "yolo_core_boxes.shp"
 EXPAND_SHP_NAME = "yolo_expand_boxes.shp"
 VALID_CSV_NAME = "all_yolo_h123.csv"
 REJECT_CSV_NAME = "all_yolo_h123_reject.csv"
+
+# These fields are produced by CalculateH123.py and are only inherited here.
+# ExtendCalculateH123.py does not re-classify filled craters.
+FILLED_FLAG_COLS = [
+    'crater_filled_flag', 'profile_filled_flag', 'filled_checked',
+    'filled_slope_ratio_le1', 'filled_slope_le1_count', 'filled_slope_valid_count',
+    'filled_slope_threshold_deg', 'filled_ratio_threshold', 'filled_reason',
+]
+
+# These fields are produced by CalculateH123.py and are inherited or refreshed here.
+BASALT_FLAG_COLS = [
+    'basalt_cf_threshold', 'peak_cf', 'rim_type_new',
+    'profile_between_valid_cf_count', 'profile_between_basalt_count', 'profile_between_nonbasalt_count',
+    'profile_both_rims_basalt', 'profile_all_between_rims_basalt',
+    'basalt_only_unpenetrated_flag', 'basalt_profile_reason', 'left_rim_cf', 'right_rim_cf',
+    'contact_idx', 'contact_global', 'contact_row', 'contact_col', 'contact_cf',
+    'h_basalt_elev', 'h2_basalt', 'thickness_or_depth',
+    'thickness_mode', 'basalt_contact_status', 'contact_note',
+]
 
 # =========================
 # Parameters (keep original Extend core/expand logic unchanged)
@@ -52,6 +72,9 @@ V_NOTCH_MAX_CANDIDATES = 3
 OUTER_REF_TYPE_STRICT_FLAT = 'strict_flat'
 OUTER_REF_TYPE_V_NOTCH = 'v_notch_higher_peak'
 OUTER_REF_TYPE_LOWEST_POINT = 'lowest_point_between_peaks'
+
+# Current CE5 basalt rule: CF > 8.2 indicates basalt.
+BASALT_CF_THRESHOLD = 8.2
 
 
 # -------------------------
@@ -789,7 +812,7 @@ def build_metrics(base_name, profile_type, side,
     return rec
 
 
-def evaluate_one_direction(arr, transform, boxes, reject_row: Dict):
+def evaluate_one_direction(arr, transform, boxes, reject_row: Dict, cf_arr=None):
     # globals
     core_g = boxes['core']
     exp_g = boxes['expanded']
@@ -818,6 +841,7 @@ def evaluate_one_direction(arr, transform, boxes, reject_row: Dict):
         if not (0 <= local_row < arr.shape[0]):
             return None, {'name': base_name, 'profile_type': profile_type, 'side': side, 'reason': 'line_out_of_window', 'crater_type': ''}
         values = clean_profile_values(arr[local_row, :])
+        cf_values = clean_profile_values(cf_arr[local_row, :]) if cf_arr is not None else None
         cols = np.arange(arr.shape[1])
         rows = np.full(arr.shape[1], local_row, dtype=int)
         lon, lat = rasterio.transform.xy(transform, rows, cols)
@@ -844,6 +868,7 @@ def evaluate_one_direction(arr, transform, boxes, reject_row: Dict):
         if not (0 <= local_col < arr.shape[1]):
             return None, {'name': base_name, 'profile_type': profile_type, 'side': side, 'reason': 'line_out_of_window', 'crater_type': ''}
         values = clean_profile_values(arr[:, local_col])
+        cf_values = clean_profile_values(cf_arr[:, local_col]) if cf_arr is not None else None
         rows = np.arange(arr.shape[0])
         cols = np.full(arr.shape[0], local_col, dtype=int)
         lon, lat = rasterio.transform.xy(transform, rows, cols)
@@ -950,6 +975,7 @@ def evaluate_one_direction(arr, transform, boxes, reject_row: Dict):
             )
             rec['reason'] = classify_metrics(rec)
             rec = add_global_idx_fields(rec, profile_type, expand_start_global, fixed_index_global)
+            attach_basalt_contact_columns([rec], cf_values, values, profile_type, fixed_index_global, expand_start_global, inherited_basalt_profile_info(reject_row))
             if rec['reason'] == 'ok':
                 return rec, None
             rejects.append(rec)
@@ -1034,10 +1060,198 @@ def draw_show_figure(show_png: Path, arr: np.ndarray, boxes_local: Dict,
     plt.close(fig)
 
 
-def process_one_feature(src, geom, base_name: str, reject_rows: pd.DataFrame, output_dir: Path):
+
+
+
+
+def _safe_int(v):
+    try:
+        if v is None or pd.isna(v):
+            return None
+        vv = float(v)
+        if not np.isfinite(vv):
+            return None
+        return int(round(vv))
+    except Exception:
+        return None
+
+
+def inherited_basalt_profile_info(src_rec):
+    """Inherit profile-level basalt-only fields from step1 reject CSV."""
+    defaults = {
+        'profile_between_valid_cf_count': 0,
+        'profile_between_basalt_count': 0,
+        'profile_between_nonbasalt_count': 0,
+        'profile_both_rims_basalt': 0,
+        'profile_all_between_rims_basalt': 0,
+        'basalt_only_unpenetrated_flag': 0,
+        'basalt_profile_reason': '',
+        'left_rim_cf': np.nan,
+        'right_rim_cf': np.nan,
+    }
+    out = {}
+    for k, default in defaults.items():
+        out[k] = src_rec[k] if hasattr(src_rec, 'index') and k in src_rec.index else default
+    return out
+
+
+def attach_basalt_contact_columns(records, cf_values, dem_values, profile_type, fixed_index_global,
+                                  expand_start_global, profile_basalt_info,
+                                  threshold=BASALT_CF_THRESHOLD):
+    """
+    Add CF-contact fields to step2 records using the remedial peak/bottom indices.
+    This does not change the original Extend H123 logic.
+    """
+    for rec in records:
+        for k, v in profile_basalt_info.items():
+            rec[k] = v
+        rec['basalt_cf_threshold'] = float(threshold)
+        rec['peak_cf'] = np.nan
+        rec['rim_type_new'] = 'unknown'
+        rec['contact_idx'] = np.nan
+        rec['contact_global'] = np.nan
+        rec['contact_row'] = np.nan
+        rec['contact_col'] = np.nan
+        rec['contact_cf'] = np.nan
+        rec['h_basalt_elev'] = np.nan
+        rec['h2_basalt'] = np.nan
+        rec['thickness_or_depth'] = np.nan
+        rec['thickness_mode'] = 'not_calculated'
+        rec['basalt_contact_status'] = 'not_started'
+        rec['contact_note'] = ''
+
+        if cf_values is None or len(cf_values) == 0:
+            rec['basalt_contact_status'] = 'missing_cf_profile'
+            continue
+
+        peak_idx = _safe_int(rec.get('peak_idx', np.nan))
+        bottom_idx = _safe_int(rec.get('bottom_idx', np.nan))
+        if peak_idx is None or peak_idx < 0 or peak_idx >= len(cf_values):
+            rec['basalt_contact_status'] = 'invalid_peak_idx'
+            continue
+
+        peak_cf = float(cf_values[peak_idx]) if np.isfinite(cf_values[peak_idx]) else np.nan
+        rec['peak_cf'] = peak_cf
+        if not np.isfinite(peak_cf):
+            rec['basalt_contact_status'] = 'invalid_peak_cf'
+            continue
+
+        rim_is_basalt = bool(peak_cf > threshold)
+        rec['rim_type_new'] = 'basalt_rim' if rim_is_basalt else 'nonbasalt_rim'
+
+        if int(profile_basalt_info.get('basalt_only_unpenetrated_flag', 0)) == 1:
+            rec['thickness_mode'] = 'basalt_rim_all_between_rims_basalt_no_thickness'
+            rec['basalt_contact_status'] = 'excluded_basalt_only_unpenetrated'
+            continue
+
+        if bottom_idx is None or bottom_idx < 0 or bottom_idx >= len(cf_values):
+            rec['basalt_contact_status'] = 'invalid_bottom_idx'
+            continue
+        if peak_idx == bottom_idx:
+            rec['basalt_contact_status'] = 'peak_equals_bottom'
+            continue
+
+        step = 1 if bottom_idx > peak_idx else -1
+        idxs = list(range(peak_idx, bottom_idx + step, step))
+        if len(idxs) < 2:
+            rec['basalt_contact_status'] = 'too_few_peak_to_bottom_pixels'
+            continue
+
+        contact_i = None
+        if rim_is_basalt:
+            for ii in idxs[1:]:
+                if np.isfinite(cf_values[ii]) and cf_values[ii] <= threshold:
+                    contact_i = int(ii)
+                    break
+            if contact_i is None:
+                rec['thickness_mode'] = 'basalt_rim_contact_not_found'
+                rec['basalt_contact_status'] = 'basalt_rim_no_nonbasalt_contact_before_bottom'
+                continue
+            rec['thickness_mode'] = 'basalt_rim_thickness'
+            rec['contact_note'] = 'first non-basalt pixel after basalt rim; next pixel after last basalt pixel'
+        else:
+            for ii in idxs[1:]:
+                if np.isfinite(cf_values[ii]) and cf_values[ii] > threshold:
+                    contact_i = int(ii)
+                    break
+            if contact_i is None:
+                rec['thickness_mode'] = 'no_basalt_detected'
+                rec['basalt_contact_status'] = 'no_basalt_detected_from_rim_to_bottom'
+                continue
+            rec['thickness_mode'] = 'nonbasalt_rim_burial_depth'
+            rec['contact_note'] = 'first basalt pixel from non-basalt rim inward'
+
+        if contact_i < 0 or contact_i >= len(dem_values) or not np.isfinite(dem_values[contact_i]):
+            rec['basalt_contact_status'] = 'invalid_contact_dem'
+            continue
+
+        h1 = rec.get('h1', np.nan)
+        peak_val = rec.get('peak_val', np.nan)
+        try:
+            h1 = float(h1)
+            peak_val = float(peak_val)
+        except Exception:
+            h1 = np.nan
+            peak_val = np.nan
+        if not (np.isfinite(h1) and np.isfinite(peak_val)):
+            rec['basalt_contact_status'] = 'invalid_h1_or_peak_val'
+            continue
+
+        h_basalt_elev = float(dem_values[contact_i])
+        h2_basalt = float(peak_val - h_basalt_elev)
+        thickness_or_depth = float(0.8 * (h2_basalt - 0.2 * h1))
+        rec['contact_idx'] = int(contact_i)
+        rec['contact_global'] = int(expand_start_global + contact_i)
+        if profile_type == 'row':
+            rec['contact_row'] = int(fixed_index_global)
+            rec['contact_col'] = int(expand_start_global + contact_i)
+        else:
+            rec['contact_row'] = int(expand_start_global + contact_i)
+            rec['contact_col'] = int(fixed_index_global)
+        rec['contact_cf'] = float(cf_values[contact_i]) if np.isfinite(cf_values[contact_i]) else np.nan
+        rec['h_basalt_elev'] = h_basalt_elev
+        rec['h2_basalt'] = h2_basalt
+        rec['thickness_or_depth'] = thickness_or_depth if thickness_or_depth >= 0 else np.nan
+        rec['basalt_contact_status'] = 'ok' if thickness_or_depth >= 0 else 'negative_result_set_nan'
+
+def inherit_filled_columns(out_rec: Optional[Dict], src_rec) -> Optional[Dict]:
+    """
+    Copy filled-crater fields from step1 reject CSV into step2 records.
+    This keeps ExtendCalculateH123.py as a remedial H123 calculator only.
+    """
+    if out_rec is None:
+        return None
+    for c in FILLED_FLAG_COLS:
+        if c in src_rec.index:
+            out_rec[c] = src_rec[c]
+        else:
+            if c in ('crater_filled_flag', 'profile_filled_flag', 'filled_checked',
+                     'filled_slope_le1_count', 'filled_slope_valid_count'):
+                out_rec[c] = 0
+            elif c in ('filled_slope_ratio_le1', 'filled_slope_threshold_deg', 'filled_ratio_threshold'):
+                out_rec[c] = np.nan
+            else:
+                out_rec[c] = ''
+    for c in BASALT_FLAG_COLS:
+        if c in src_rec.index:
+            out_rec[c] = src_rec[c]
+        elif c in ('profile_between_valid_cf_count', 'profile_between_basalt_count', 'profile_between_nonbasalt_count',
+                   'profile_both_rims_basalt', 'profile_all_between_rims_basalt', 'basalt_only_unpenetrated_flag'):
+            out_rec[c] = 0
+        elif c in ('basalt_cf_threshold', 'peak_cf', 'left_rim_cf', 'right_rim_cf', 'contact_idx', 'contact_global',
+                   'contact_row', 'contact_col', 'contact_cf', 'h_basalt_elev', 'h2_basalt', 'thickness_or_depth'):
+            out_rec[c] = np.nan
+        elif c in ('rim_type_new', 'thickness_mode', 'basalt_contact_status', 'contact_note', 'basalt_profile_reason'):
+            out_rec[c] = ''
+        else:
+            out_rec[c] = np.nan
+    return out_rec
+
+def process_one_feature(src, cf_src, geom, base_name: str, reject_rows: pd.DataFrame, output_dir: Path):
     rmin, rmax, cmin, cmax = geom_bounds_to_rc(src, geom)
     boxes = make_boxes_from_original(rmin, rmax, cmin, cmax, src)
     arr, transform = read_window(src, boxes['expanded']['rmin'], boxes['expanded']['rmax'], boxes['expanded']['cmin'], boxes['expanded']['cmax'])
+    cf_arr, _ = read_window(cf_src, boxes['expanded']['rmin'], boxes['expanded']['rmax'], boxes['expanded']['cmin'], boxes['expanded']['cmax'])
     row_off = boxes['expanded']['rmin']
     col_off = boxes['expanded']['cmin']
     boxes_local = {
@@ -1060,11 +1274,13 @@ def process_one_feature(src, geom, base_name: str, reject_rows: pd.DataFrame, ou
     # one record per rejected direction
     dedup = reject_rows.drop_duplicates(subset=['name', 'profile_type', 'side'], keep='first')
     for _, rec in dedup.iterrows():
-        valid_rec, reject_rec = evaluate_one_direction(arr, transform, boxes, rec)
+        valid_rec, reject_rec = evaluate_one_direction(arr, transform, boxes, rec, cf_arr=cf_arr)
         if valid_rec is not None:
+            valid_rec = inherit_filled_columns(valid_rec, rec)
             valid_records.append(valid_rec)
             chosen = valid_rec
         else:
+            reject_rec = inherit_filled_columns(reject_rec, rec)
             reject_records.append(reject_rec)
             chosen = reject_rec
         if rec['profile_type'] == 'row' and row_plot is None:
@@ -1082,10 +1298,12 @@ def process_one_feature(src, geom, base_name: str, reject_rows: pd.DataFrame, ou
     return valid_records, reject_records, out_geoms
 
 
-def run(dem_path: Path, shp_path: Path, step1_reject_csv: Path, output_dir: Path):
+def run(dem_path: Path, cf_path: Path, shp_path: Path, step1_reject_csv: Path, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     if not dem_path.exists():
         raise FileNotFoundError(f'未找到 DEM：{dem_path}')
+    if not cf_path.exists():
+        raise FileNotFoundError(f'未找到 CF：{cf_path}')
     if not shp_path.exists():
         raise FileNotFoundError(f'未找到 SHP：{shp_path}')
     if not step1_reject_csv.exists():
@@ -1106,7 +1324,9 @@ def run(dem_path: Path, shp_path: Path, step1_reject_csv: Path, output_dir: Path
     expanded_geoms = []
     core_geoms = []
 
-    with rasterio.open(dem_path) as src:
+    with rasterio.open(dem_path) as src, rasterio.open(cf_path) as cf_src:
+        if src.width != cf_src.width or src.height != cf_src.height:
+            raise ValueError(f'CF 与 DEM 尺寸不一致：DEM={src.height}x{src.width}, CF={cf_src.height}x{cf_src.width}。请先配准/重采样 CF 到 DEM 网格。')
         gdf = gpd.read_file(shp_path)
         gdf, work_crs = harmonize_vector_raster_crs(gdf, src)
         field_name = infer_name_field(gdf)
@@ -1129,7 +1349,7 @@ def run(dem_path: Path, shp_path: Path, step1_reject_csv: Path, output_dir: Path
                     })
                 continue
             try:
-                valid_i, reject_i, out_geoms = process_one_feature(src, geom, str(base_name), subdf, output_dir)
+                valid_i, reject_i, out_geoms = process_one_feature(src, cf_src, geom, str(base_name), subdf, output_dir)
                 valid_records.extend(valid_i)
                 reject_records.extend(reject_i)
                 expanded_geoms.append({'name': str(base_name), 'geometry': out_geoms['expanded_geom']})
@@ -1145,6 +1365,16 @@ def run(dem_path: Path, shp_path: Path, step1_reject_csv: Path, output_dir: Path
         'name', 'profile_type', 'side', 'reason',
         'peak_val', 'outer_mean', 'bottom_elev',
         'h1', 'h2', 'h3', 'h3t', 'crater_type',
+        'crater_filled_flag', 'profile_filled_flag', 'filled_checked',
+        'filled_slope_ratio_le1', 'filled_slope_le1_count', 'filled_slope_valid_count',
+        'filled_slope_threshold_deg', 'filled_ratio_threshold', 'filled_reason',
+        'basalt_cf_threshold', 'peak_cf', 'rim_type_new',
+        'profile_between_valid_cf_count', 'profile_between_basalt_count', 'profile_between_nonbasalt_count',
+        'profile_both_rims_basalt', 'profile_all_between_rims_basalt',
+        'basalt_only_unpenetrated_flag', 'basalt_profile_reason', 'left_rim_cf', 'right_rim_cf',
+        'contact_idx', 'contact_global', 'contact_row', 'contact_col', 'contact_cf',
+        'h_basalt_elev', 'h2_basalt', 'thickness_or_depth',
+        'thickness_mode', 'basalt_contact_status', 'contact_note',
         'line_dem_row', 'line_dem_col',
         'center_row', 'center_col',
         'core_start_global', 'core_end_global',
@@ -1177,6 +1407,7 @@ def run(dem_path: Path, shp_path: Path, step1_reject_csv: Path, output_dir: Path
     gpd.GeoDataFrame(expanded_geoms, geometry='geometry', crs=work_crs).to_file(output_dir / EXPAND_SHP_NAME, driver='ESRI Shapefile', encoding='utf-8')
 
     print(f'DEM 路径      : {dem_path}')
+    print(f'CF 路径       : {cf_path}')
     print(f'SHP 路径      : {shp_path}')
     print(f'step1 reject  : {step1_reject_csv}')
     print(f'输出目录      : {output_dir}')
@@ -1193,8 +1424,9 @@ def run(dem_path: Path, shp_path: Path, step1_reject_csv: Path, output_dir: Path
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='ExtendCalculateH123 step2：只读取 step1 reject 的方向，保留原 Extend core/扩大算法，outer 仅允许 平坦区 or V型最低点')
     parser.add_argument('--dem', default=str(DEFAULT_DEM_PATH), help='DEM 路径')
+    parser.add_argument('--cf', default=str(DEFAULT_CF_PATH), help='CF 路径')
     parser.add_argument('--shp', default=str(DEFAULT_SHP_PATH), help='SHP 路径')
     parser.add_argument('--step1-reject', default=str(DEFAULT_STEP1_REJECT_CSV), help='step1 的 reject CSV 路径')
     parser.add_argument('--out', default=str(DEFAULT_OUTPUT_DIR), help='输出目录')
     args = parser.parse_args()
-    run(Path(args.dem), Path(args.shp), Path(args.step1_reject), Path(args.out))
+    run(Path(args.dem), Path(args.cf), Path(args.shp), Path(args.step1_reject), Path(args.out))

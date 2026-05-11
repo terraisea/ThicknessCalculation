@@ -17,6 +17,7 @@ from shapely.geometry import box
 # Easy-to-edit input/output paths
 # =========================
 DEM_PATH = Path(r"Database/CE5/CE5_dem.tif")
+CF_PATH = Path(r"Database/CE5/CE5_CF.tif")
 SHP_PATH = Path(r"Database/CE5/exce5/yolo_ce5.shp")
 OUTPUT_DIR = Path(r"Database/CE5/yolo/chickin/step1")
 PLOT_DIR = OUTPUT_DIR / "plots"
@@ -64,6 +65,22 @@ TYPE3_SLOPE_BREAK_AFTER = 3           # slope samples after candidate kink
 TYPE3_MIN_INNER_FRAC = 0.15           # ignore candidates too close to the rim
 TYPE3_MAX_INNER_FRAC = 0.90           # ignore candidates too close to the center
 TYPE3_DEPTH_FRAC_WEIGHT = 5.0         #
+
+# =========================
+# Filled-crater flag parameters
+# =========================
+# If >=60% of valid slopes between the two rims are <=1 degree,
+# the profile is marked as filled. This only adds CSV flags and does
+# not change the original H123 calculation logic.
+FILLED_SLOPE_THRESHOLD_DEG = 1.0
+FILLED_RATIO_THRESHOLD = 0.60
+
+# =========================
+# Basalt contact extraction parameters
+# =========================
+# Current CE5 basalt rule: CF > 8.2 indicates basalt.
+# These fields are only added to CSV and do not change the original H123 logic.
+BASALT_CF_THRESHOLD = 8.2
 
 def clean_profile_values(values, nodata=None, invalid_low=INVALID_LOW):
     values = np.asarray(values, dtype=float).copy()
@@ -120,6 +137,295 @@ def calc_point_slopes(values, xs, ys, is_geographic=True):
         slopes[i] = abs(math.degrees(math.atan(dz / dist_m)))
     return slopes
 
+
+
+
+def analyze_filled_between_rims(values, xs, ys, left_peak_idx, right_peak_idx,
+                                slope_threshold=FILLED_SLOPE_THRESHOLD_DEG,
+                                ratio_threshold=FILLED_RATIO_THRESHOLD):
+    """
+    Filled-crater flag only. This function does not modify rim/bottom/H123 logic.
+
+    Rule:
+      Between the two rims, if >=60% of valid center-difference slope points are
+      <=1 degree, the row/col profile is marked as filled.
+    """
+    info = {
+        "filled_checked": 0,
+        "profile_filled_flag": 0,
+        "filled_slope_ratio_le1": np.nan,
+        "filled_slope_le1_count": 0,
+        "filled_slope_valid_count": 0,
+        "filled_slope_threshold_deg": float(slope_threshold),
+        "filled_ratio_threshold": float(ratio_threshold),
+        "filled_reason": "not_checked",
+    }
+
+    try:
+        left_peak_idx = int(left_peak_idx)
+        right_peak_idx = int(right_peak_idx)
+    except Exception:
+        info["filled_reason"] = "invalid_rim_index"
+        return info
+
+    if left_peak_idx < 0 or right_peak_idx < 0 or left_peak_idx >= len(values) or right_peak_idx >= len(values):
+        info["filled_reason"] = "rim_index_out_of_range"
+        return info
+
+    lo = int(min(left_peak_idx, right_peak_idx))
+    hi = int(max(left_peak_idx, right_peak_idx))
+    if hi - lo < 2:
+        info["filled_reason"] = "too_few_points_between_rims"
+        return info
+
+    slopes = calc_point_slopes(values, xs, ys, is_geographic=True)
+    seg = slopes[lo:hi + 1]
+    seg = seg[np.isfinite(seg)]
+
+    info["filled_checked"] = 1
+    info["filled_slope_valid_count"] = int(seg.size)
+
+    if seg.size == 0:
+        info["filled_reason"] = "no_valid_slope_between_rims"
+        return info
+
+    le_count = int(np.sum(seg <= slope_threshold))
+    ratio = float(le_count / seg.size)
+
+    info.update({
+        "profile_filled_flag": int(ratio >= ratio_threshold),
+        "filled_slope_ratio_le1": ratio,
+        "filled_slope_le1_count": le_count,
+        "filled_reason": "filled_by_slope_ratio" if ratio >= ratio_threshold else "not_filled_by_slope_ratio",
+    })
+    return info
+
+
+def analyze_filled_from_geom(values, xs, ys, geom_info):
+    if not isinstance(geom_info, dict) or int(geom_info.get('geometry_ok', 0)) != 1:
+        return {
+            "filled_checked": 0,
+            "profile_filled_flag": 0,
+            "filled_slope_ratio_le1": np.nan,
+            "filled_slope_le1_count": 0,
+            "filled_slope_valid_count": 0,
+            "filled_slope_threshold_deg": float(FILLED_SLOPE_THRESHOLD_DEG),
+            "filled_ratio_threshold": float(FILLED_RATIO_THRESHOLD),
+            "filled_reason": geom_info.get('reason', 'invalid_geometry') if isinstance(geom_info, dict) else "invalid_geometry",
+        }
+    return analyze_filled_between_rims(
+        values=values,
+        xs=xs,
+        ys=ys,
+        left_peak_idx=geom_info.get('left_peak_idx', np.nan),
+        right_peak_idx=geom_info.get('right_peak_idx', np.nan),
+    )
+
+
+def attach_filled_columns(records, profile_filled_info, crater_filled_flag):
+    for rec in records:
+        rec['profile_filled_flag'] = int(profile_filled_info.get('profile_filled_flag', 0))
+        rec['crater_filled_flag'] = int(crater_filled_flag)
+        rec['filled_checked'] = int(profile_filled_info.get('filled_checked', 0))
+        rec['filled_slope_ratio_le1'] = profile_filled_info.get('filled_slope_ratio_le1', np.nan)
+        rec['filled_slope_le1_count'] = int(profile_filled_info.get('filled_slope_le1_count', 0))
+        rec['filled_slope_valid_count'] = int(profile_filled_info.get('filled_slope_valid_count', 0))
+        rec['filled_slope_threshold_deg'] = profile_filled_info.get('filled_slope_threshold_deg', FILLED_SLOPE_THRESHOLD_DEG)
+        rec['filled_ratio_threshold'] = profile_filled_info.get('filled_ratio_threshold', FILLED_RATIO_THRESHOLD)
+        rec['filled_reason'] = profile_filled_info.get('filled_reason', '')
+
+
+
+# =========================
+# Basalt contact helpers
+# =========================
+def _safe_int(v):
+    try:
+        if v is None or pd.isna(v):
+            return None
+        vv = float(v)
+        if not np.isfinite(vv):
+            return None
+        return int(round(vv))
+    except Exception:
+        return None
+
+
+def analyze_basalt_between_rims(cf_values, geom_info, threshold=BASALT_CF_THRESHOLD):
+    """
+    Profile-level basalt-only/unpenetrated flag.
+    It uses the two rim indices already identified by the existing H123 geometry logic.
+    """
+    info = {
+        'profile_between_valid_cf_count': 0,
+        'profile_between_basalt_count': 0,
+        'profile_between_nonbasalt_count': 0,
+        'profile_both_rims_basalt': 0,
+        'profile_all_between_rims_basalt': 0,
+        'basalt_only_unpenetrated_flag': 0,
+        'basalt_profile_reason': 'not_checked',
+        'left_rim_cf': np.nan,
+        'right_rim_cf': np.nan,
+    }
+    if not isinstance(geom_info, dict) or int(geom_info.get('geometry_ok', 0)) != 1:
+        info['basalt_profile_reason'] = geom_info.get('reason', 'invalid_geometry') if isinstance(geom_info, dict) else 'invalid_geometry'
+        return info
+
+    left_idx = _safe_int(geom_info.get('left_peak_idx', np.nan))
+    right_idx = _safe_int(geom_info.get('right_peak_idx', np.nan))
+    if left_idx is None or right_idx is None:
+        info['basalt_profile_reason'] = 'invalid_rim_index'
+        return info
+    if left_idx < 0 or right_idx < 0 or left_idx >= len(cf_values) or right_idx >= len(cf_values):
+        info['basalt_profile_reason'] = 'rim_index_out_of_range'
+        return info
+
+    lo = int(min(left_idx, right_idx))
+    hi = int(max(left_idx, right_idx))
+    seg = np.asarray(cf_values[lo:hi + 1], dtype=float)
+    valid = np.isfinite(seg)
+    valid_cf = seg[valid]
+    if valid_cf.size == 0:
+        info['basalt_profile_reason'] = 'no_valid_cf_between_rims'
+        return info
+
+    basalt = valid_cf > threshold
+    left_cf = float(cf_values[left_idx]) if np.isfinite(cf_values[left_idx]) else np.nan
+    right_cf = float(cf_values[right_idx]) if np.isfinite(cf_values[right_idx]) else np.nan
+    both_rims_basalt = bool(np.isfinite(left_cf) and np.isfinite(right_cf) and left_cf > threshold and right_cf > threshold)
+    all_between_basalt = bool(valid_cf.size > 0 and np.all(basalt))
+
+    info.update({
+        'profile_between_valid_cf_count': int(valid_cf.size),
+        'profile_between_basalt_count': int(np.sum(basalt)),
+        'profile_between_nonbasalt_count': int(np.sum(~basalt)),
+        'profile_both_rims_basalt': int(both_rims_basalt),
+        'profile_all_between_rims_basalt': int(all_between_basalt),
+        'basalt_only_unpenetrated_flag': int(both_rims_basalt and all_between_basalt),
+        'basalt_profile_reason': 'basalt_only_unpenetrated' if (both_rims_basalt and all_between_basalt) else 'checked',
+        'left_rim_cf': left_cf,
+        'right_rim_cf': right_cf,
+    })
+    return info
+
+
+def attach_basalt_contact_columns(records, cf_values, dem_values, profile_type, fixed_index_global,
+                                  expand_start_global, profile_basalt_info,
+                                  threshold=BASALT_CF_THRESHOLD):
+    """
+    Add CF-contact fields to each H123 side record.
+    The existing record's peak_idx/bottom_idx/h1/peak_val are used; no rim/bottom/H123 logic is changed.
+    """
+    for rec in records:
+        for k, v in profile_basalt_info.items():
+            rec[k] = v
+        rec['basalt_cf_threshold'] = float(threshold)
+        rec['peak_cf'] = np.nan
+        rec['rim_type_new'] = 'unknown'
+        rec['contact_idx'] = np.nan
+        rec['contact_global'] = np.nan
+        rec['contact_row'] = np.nan
+        rec['contact_col'] = np.nan
+        rec['contact_cf'] = np.nan
+        rec['h_basalt_elev'] = np.nan
+        rec['h2_basalt'] = np.nan
+        rec['thickness_or_depth'] = np.nan
+        rec['thickness_mode'] = 'not_calculated'
+        rec['basalt_contact_status'] = 'not_started'
+        rec['contact_note'] = ''
+
+        peak_idx = _safe_int(rec.get('peak_idx', np.nan))
+        bottom_idx = _safe_int(rec.get('bottom_idx', np.nan))
+        if peak_idx is None or peak_idx < 0 or peak_idx >= len(cf_values):
+            rec['basalt_contact_status'] = 'invalid_peak_idx'
+            continue
+
+        peak_cf = float(cf_values[peak_idx]) if np.isfinite(cf_values[peak_idx]) else np.nan
+        rec['peak_cf'] = peak_cf
+        if not np.isfinite(peak_cf):
+            rec['basalt_contact_status'] = 'invalid_peak_cf'
+            continue
+
+        rim_is_basalt = bool(peak_cf > threshold)
+        rec['rim_type_new'] = 'basalt_rim' if rim_is_basalt else 'nonbasalt_rim'
+
+        if int(profile_basalt_info.get('basalt_only_unpenetrated_flag', 0)) == 1:
+            rec['thickness_mode'] = 'basalt_rim_all_between_rims_basalt_no_thickness'
+            rec['basalt_contact_status'] = 'excluded_basalt_only_unpenetrated'
+            continue
+
+        if bottom_idx is None or bottom_idx < 0 or bottom_idx >= len(cf_values):
+            rec['basalt_contact_status'] = 'invalid_bottom_idx'
+            continue
+
+        if peak_idx == bottom_idx:
+            rec['basalt_contact_status'] = 'peak_equals_bottom'
+            continue
+
+        step = 1 if bottom_idx > peak_idx else -1
+        idxs = list(range(peak_idx, bottom_idx + step, step))
+        if len(idxs) < 2:
+            rec['basalt_contact_status'] = 'too_few_peak_to_bottom_pixels'
+            continue
+
+        contact_i = None
+        if rim_is_basalt:
+            # First non-basalt pixel inward; this is the next pixel after the last basalt pixel.
+            for ii in idxs[1:]:
+                if np.isfinite(cf_values[ii]) and cf_values[ii] <= threshold:
+                    contact_i = int(ii)
+                    break
+            if contact_i is None:
+                rec['thickness_mode'] = 'basalt_rim_contact_not_found'
+                rec['basalt_contact_status'] = 'basalt_rim_no_nonbasalt_contact_before_bottom'
+                continue
+            rec['thickness_mode'] = 'basalt_rim_thickness'
+            rec['contact_note'] = 'first non-basalt pixel after basalt rim; next pixel after last basalt pixel'
+        else:
+            # First basalt pixel inward; result is burial depth, not layer thickness by itself.
+            for ii in idxs[1:]:
+                if np.isfinite(cf_values[ii]) and cf_values[ii] > threshold:
+                    contact_i = int(ii)
+                    break
+            if contact_i is None:
+                rec['thickness_mode'] = 'no_basalt_detected'
+                rec['basalt_contact_status'] = 'no_basalt_detected_from_rim_to_bottom'
+                continue
+            rec['thickness_mode'] = 'nonbasalt_rim_burial_depth'
+            rec['contact_note'] = 'first basalt pixel from non-basalt rim inward'
+
+        if contact_i < 0 or contact_i >= len(dem_values) or not np.isfinite(dem_values[contact_i]):
+            rec['basalt_contact_status'] = 'invalid_contact_dem'
+            continue
+
+        h1 = rec.get('h1', np.nan)
+        peak_val = rec.get('peak_val', np.nan)
+        try:
+            h1 = float(h1)
+            peak_val = float(peak_val)
+        except Exception:
+            h1 = np.nan
+            peak_val = np.nan
+        if not (np.isfinite(h1) and np.isfinite(peak_val)):
+            rec['basalt_contact_status'] = 'invalid_h1_or_peak_val'
+            continue
+
+        h_basalt_elev = float(dem_values[contact_i])
+        h2_basalt = float(peak_val - h_basalt_elev)
+        thickness_or_depth = float(0.8 * (h2_basalt - 0.2 * h1))
+        rec['contact_idx'] = int(contact_i)
+        rec['contact_global'] = int(expand_start_global + contact_i)
+        if profile_type == 'row':
+            rec['contact_row'] = int(fixed_index_global)
+            rec['contact_col'] = int(expand_start_global + contact_i)
+        else:
+            rec['contact_row'] = int(expand_start_global + contact_i)
+            rec['contact_col'] = int(fixed_index_global)
+        rec['contact_cf'] = float(cf_values[contact_i]) if np.isfinite(cf_values[contact_i]) else np.nan
+        rec['h_basalt_elev'] = h_basalt_elev
+        rec['h2_basalt'] = h2_basalt
+        rec['thickness_or_depth'] = thickness_or_depth if thickness_or_depth >= 0 else np.nan
+        rec['basalt_contact_status'] = 'ok' if thickness_or_depth >= 0 else 'negative_result_set_nan'
 
 def crs_body_type(crs) -> str:
     if crs is None:
@@ -1587,14 +1893,19 @@ def evaluate_profile(name, profile_type, values, xs, ys, fixed_index,
 
 
 
-def main(dem_path=DEM_PATH, shp_path=SHP_PATH):
+def main(dem_path=DEM_PATH, shp_path=SHP_PATH, cf_path=CF_PATH):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
-    with rasterio.open(dem_path) as ds:
+    with rasterio.open(dem_path) as ds, rasterio.open(cf_path) as cf_ds:
         dem = ds.read(1)
         nodata = ds.nodata
         dem = clean_profile_values(dem, nodata=nodata)
+
+        cf = cf_ds.read(1).astype(float)
+        cf = clean_profile_values(cf, nodata=cf_ds.nodata)
+        if cf.shape != dem.shape:
+            raise ValueError(f"CF 与 DEM 尺寸不一致：DEM={dem.shape}, CF={cf.shape}。请先配准/重采样 CF 到 DEM 网格。")
 
         gdf = gpd.read_file(shp_path)
         gdf, work_crs = harmonize_vector_raster_crs(gdf, ds)
@@ -1607,6 +1918,7 @@ def main(dem_path=DEM_PATH, shp_path=SHP_PATH):
         reject_records = []
 
         print(f"DEM: {dem_path}")
+        print(f"CF : {cf_path}")
         print(f"SHP: {shp_path}")
         print(f"输出目录: {OUTPUT_DIR}")
         print(f"plot目录: {PLOT_DIR}")
@@ -1653,6 +1965,8 @@ def main(dem_path=DEM_PATH, shp_path=SHP_PATH):
             patch = dem[exp_row_min:exp_row_max + 1, exp_col_min:exp_col_max + 1]
             row_values = dem[center_row, exp_col_min:exp_col_max + 1]
             col_values = dem[exp_row_min:exp_row_max + 1, center_col]
+            row_cf_values = cf[center_row, exp_col_min:exp_col_max + 1]
+            col_cf_values = cf[exp_row_min:exp_row_max + 1, center_col]
 
             row_xs, row_ys = line_coords(ds.transform, "row", center_row, exp_col_min, exp_col_max)
             col_xs, col_ys = line_coords(ds.transform, "col", center_col, exp_row_min, exp_row_max)
@@ -1672,6 +1986,18 @@ def main(dem_path=DEM_PATH, shp_path=SHP_PATH):
                 values=col_values, xs=col_xs, ys=col_ys,
                 core_start_idx=col_core_start_idx, core_end_idx=col_core_end_idx, center_idx=col_center_idx
             )
+
+            # Filled-crater flag only; this does not affect the original H123 calculation.
+            row_filled_info = analyze_filled_from_geom(row_values, row_xs, row_ys, row_geom)
+            col_filled_info = analyze_filled_from_geom(col_values, col_xs, col_ys, col_geom)
+            crater_filled_flag = int(
+                int(row_filled_info.get('profile_filled_flag', 0)) == 1 or
+                int(col_filled_info.get('profile_filled_flag', 0)) == 1
+            )
+
+            # Profile-level basalt-only flag between the two rims.
+            row_basalt_info = analyze_basalt_between_rims(row_cf_values, row_geom)
+            col_basalt_info = analyze_basalt_between_rims(col_cf_values, col_geom)
 
             diameter_candidates = []
             for geom_info in [row_geom, col_geom]:
@@ -1778,6 +2104,16 @@ def main(dem_path=DEM_PATH, shp_path=SHP_PATH):
             attach_uplift_columns(row_rejects, crater_type, crater_type_code)
             attach_uplift_columns(col_rejects, crater_type, crater_type_code)
 
+            attach_filled_columns(row_valids, row_filled_info, crater_filled_flag)
+            attach_filled_columns(col_valids, col_filled_info, crater_filled_flag)
+            attach_filled_columns(row_rejects, row_filled_info, crater_filled_flag)
+            attach_filled_columns(col_rejects, col_filled_info, crater_filled_flag)
+
+            attach_basalt_contact_columns(row_valids, row_cf_values, row_values, 'row', center_row, exp_col_min, row_basalt_info)
+            attach_basalt_contact_columns(col_valids, col_cf_values, col_values, 'col', center_col, exp_row_min, col_basalt_info)
+            attach_basalt_contact_columns(row_rejects, row_cf_values, row_values, 'row', center_row, exp_col_min, row_basalt_info)
+            attach_basalt_contact_columns(col_rejects, col_cf_values, col_values, 'col', center_col, exp_row_min, col_basalt_info)
+
             valid_records.extend(row_valids)
             valid_records.extend(col_valids)
             reject_records.extend(row_rejects)
@@ -1817,6 +2153,16 @@ def main(dem_path=DEM_PATH, shp_path=SHP_PATH):
         "name", "profile_type", "side", "reason",
         "peak_val", "outer_mean", "bottom_elev",
         "h1", "h2", "h3", "h3t", "crater_type", "crater_type_code",
+        "crater_filled_flag", "profile_filled_flag", "filled_checked",
+        "filled_slope_ratio_le1", "filled_slope_le1_count", "filled_slope_valid_count",
+        "filled_slope_threshold_deg", "filled_ratio_threshold", "filled_reason",
+        "basalt_cf_threshold", "peak_cf", "rim_type_new",
+        "profile_between_valid_cf_count", "profile_between_basalt_count", "profile_between_nonbasalt_count",
+        "profile_both_rims_basalt", "profile_all_between_rims_basalt",
+        "basalt_only_unpenetrated_flag", "basalt_profile_reason", "left_rim_cf", "right_rim_cf",
+        "contact_idx", "contact_global", "contact_row", "contact_col", "contact_cf",
+        "h_basalt_elev", "h2_basalt", "thickness_or_depth",
+        "thickness_mode", "basalt_contact_status", "contact_note",
         "side_crater_type", "bottom_rule", "kink_slope_deg",
         "inner_flat_first_idx", "inner_flat_last_idx", "inner_flat_n",
         "profile_non_normal", "center_max_intersections", "center_test_level",
@@ -1867,6 +2213,7 @@ def main(dem_path=DEM_PATH, shp_path=SHP_PATH):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="直接读取 DEM 与 yolo 坑框计算 h1/h2/h3/h3t")
     parser.add_argument("--dem", type=str, default=str(DEM_PATH), help="DEM 路径")
+    parser.add_argument("--cf", type=str, default=str(CF_PATH), help="CF 路径")
     parser.add_argument("--shp", type=str, default=str(SHP_PATH), help="shp 路径")
     args = parser.parse_args()
-    main(dem_path=Path(args.dem), shp_path=Path(args.shp))
+    main(dem_path=Path(args.dem), shp_path=Path(args.shp), cf_path=Path(args.cf))
