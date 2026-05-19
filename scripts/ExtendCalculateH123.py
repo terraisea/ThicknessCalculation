@@ -1,3 +1,4 @@
+# MODIFIED_FOR_RIM_PEAK_2026_05_12: adaptive 1/3/5 rim-height scoring; core-boundary preference cancelled; SHP points use rim peaks.
 import argparse
 import math
 from pathlib import Path
@@ -243,6 +244,39 @@ def read_window(src, rmin: int, rmax: int, cmin: int, cmax: int):
     return arr, transform
 
 
+def adaptive_rim_height_window(core_diameter_px):
+    """
+    Adaptive local height window for rim candidate ranking.
+      <=12 px : single-pixel elevation for small craters;
+      13-40 px: 3-pixel local median for medium craters;
+      >40 px : 5-pixel local median for larger craters.
+    """
+    try:
+        dpx = int(round(float(core_diameter_px)))
+    except Exception:
+        dpx = 0
+    if dpx <= 12:
+        return 1
+    if dpx <= 40:
+        return 3
+    return 5
+
+
+def local_median_height(values, idx, win):
+    idx = int(idx)
+    win = int(max(1, win))
+    if win <= 1:
+        return float(values[idx]) if 0 <= idx < len(values) and np.isfinite(values[idx]) else np.nan
+    half = win // 2
+    lo = max(0, idx - half)
+    hi = min(len(values) - 1, idx + half)
+    seg = np.asarray(values[lo:hi + 1], dtype=float)
+    seg = seg[np.isfinite(seg)]
+    if seg.size == 0:
+        return np.nan
+    return float(np.nanmedian(seg))
+
+
 # -------------------------
 # morphology helpers reused from current step2
 # -------------------------
@@ -448,114 +482,60 @@ def _is_peak_like_within_range(values: np.ndarray, idx: int, lo: int, hi: int) -
     return bool(left_ok and right_ok)
 
 
-def _find_boundary_window_candidates(values: np.ndarray, side: str, lo: int, hi: int,
-                                     boundary_idx: int, center_idx: int,
-                                     window: int = 3) -> List[int]:
-    """
-    在 core 边界附近优先找“真正的峰”，而不是把边界单点直接当成坑顶。
-
-    规则：
-    1) 仅在 boundary 附近 window 个像元内找；
-    2) 优先返回该窗口内满足 peak-like 条件的点；
-    3) 若窗口内没有 peak-like 点，再退化为窗口内最高点；
-    4) 这样可以处理 core 正好切到 rim crest，或只差 1~2 个像元的情况，
-       同时避免把开口向上的肩部/拐点直接当成坑顶。
-    """
-    lo = int(lo)
-    hi = int(hi)
-    boundary_idx = int(boundary_idx)
-    if hi < lo:
-        return []
-
-    if side == 'left':
-        w_lo = max(lo, boundary_idx)
-        w_hi = min(hi, boundary_idx + max(0, int(window) - 1))
-    else:
-        w_lo = max(lo, boundary_idx - max(0, int(window) - 1))
-        w_hi = min(hi, boundary_idx)
-
-    cand = [i for i in range(w_lo, w_hi + 1) if np.isfinite(values[i])]
-    if not cand:
-        return []
-
-    peak_like = [i for i in cand if _is_peak_like_within_range(values, i, lo, hi)]
-    if peak_like:
-        peak_like = sorted(peak_like, key=lambda i: (abs(i - boundary_idx), -values[i], abs(i - center_idx)))
-        return [int(i) for i in peak_like]
-
-    fallback = sorted(cand, key=lambda i: (-values[i], abs(i - boundary_idx), abs(i - center_idx)))
-    return [int(fallback[0])] if fallback else []
-
-
 def find_local_peak_candidates(values: np.ndarray, start_idx: int, end_idx: int, center_idx: int,
                                max_candidates: int = MAX_RIM_CANDIDATES,
                                priority_boundary_idx: Optional[int] = None,
                                side: Optional[str] = None,
-                               boundary_window: int = 3) -> List[int]:
+                               boundary_window: int = 3,
+                               core_diameter_px: Optional[int] = None) -> List[int]:
     """
-    core 内坑顶候选搜索。
+    在当前侧 core 半边内找坑顶候选。
 
-    新规则：
-    1) 先在 core 边界附近的小窗口内找“真正的峰”；
-    2) 若边界窗口内没有 peak-like 点，则退化为窗口内最高点；
-    3) 再补充 core 半边内部的局部峰；
-    4) 只要 core 半边内已经得到候选，就不再去 core 外找峰。
+    本版取消“靠近 core 边界优先”的逻辑；priority_boundary_idx、boundary_window
+    参数仅为兼容旧调用而保留，不参与排序。候选优先满足局部峰形（^），排序依据为
+    自适应局部高程：小坑 1 像元，中坑 3 像元，大坑 5 像元。
     """
     lo = int(min(start_idx, end_idx))
     hi = int(max(start_idx, end_idx))
+    lo = max(0, lo)
+    hi = min(len(values) - 1, hi)
     if hi < lo:
         return []
 
-    out = []
-    seen = set()
+    if core_diameter_px is None:
+        core_diameter_px = hi - lo + 1
+    height_win = adaptive_rim_height_window(core_diameter_px)
 
-    def push(idx: int):
-        idx = int(idx)
-        if idx in seen:
-            return
-        if idx < lo or idx > hi:
-            return
-        if not np.isfinite(values[idx]):
-            return
-        seen.add(idx)
-        out.append(idx)
-
-    boundary = None
-    if priority_boundary_idx is not None and side in ('left', 'right'):
-        boundary = int(priority_boundary_idx)
-        for idx in _find_boundary_window_candidates(values, side, lo, hi, boundary, center_idx, window=boundary_window):
-            push(idx)
-            if len(out) >= max_candidates:
-                return [int(v) for v in out]
-
-    idxs = []
+    peak_like = []
     if hi - lo + 1 >= 3:
         for i in range(lo + 1, hi):
             if not (np.isfinite(values[i - 1]) and np.isfinite(values[i]) and np.isfinite(values[i + 1])):
                 continue
             if values[i] >= values[i - 1] and values[i] >= values[i + 1]:
-                idxs.append(i)
+                peak_like.append(i)
 
-    if boundary is not None:
-        idxs = sorted(idxs, key=lambda i: (abs(i - boundary), -values[i], abs(i - center_idx)))
+    if peak_like:
+        candidates = peak_like
     else:
-        idxs = sorted(idxs, key=lambda i: (-values[i], abs(i - center_idx)))
+        # 小坑或低分辨率剖面可能没有严格局部峰，退化为半边内有限高程点。
+        candidates = [i for i in range(lo, hi + 1) if np.isfinite(values[i])]
 
-    for i in idxs:
-        push(i)
-        if len(out) >= max_candidates:
-            return [int(v) for v in out]
+    ranked = []
+    for i in candidates:
+        h = local_median_height(values, i, height_win)
+        if np.isfinite(h):
+            ranked.append((int(i), float(h), abs(int(i) - int(center_idx))))
 
-    return [int(v) for v in out]
+    ranked.sort(key=lambda t: (-t[1], -t[2]))
+    return [int(t[0]) for t in ranked[:max_candidates]]
 
 
 def find_nearest_peak_outside_core(values: np.ndarray, side: str,
                                    core_lo: int, core_hi: int,
                                    ext_lo: int, ext_hi: int) -> Optional[int]:
     """
-    先在 core 内找；若当前侧 core 内没有局部峰，则在 core 外同侧寻找离 core 最近的那个峰。
-    left 侧：在 [ext_lo, core_lo-1] 内找，优先离 core_lo 最近；
-    right 侧：在 [core_hi+1, ext_hi] 内找，优先离 core_hi 最近。
+    当前侧 core 半边没有候选时，才在 core 外同侧补充寻找候选。
+    本版取消“离 core 边界最近优先”，改为按自适应局部高程最高优先。
     """
     n = len(values)
     ext_lo = max(0, int(ext_lo))
@@ -565,25 +545,28 @@ def find_nearest_peak_outside_core(values: np.ndarray, side: str,
 
     if side == 'left':
         lo, hi = ext_lo, core_lo - 1
-        boundary = core_lo
     else:
         lo, hi = core_hi + 1, ext_hi
-        boundary = core_hi
 
-    if hi - lo + 1 < 3:
+    if hi < lo:
         return None
 
-    peaks = []
-    for i in range(lo + 1, hi):
-        if not (np.isfinite(values[i - 1]) and np.isfinite(values[i]) and np.isfinite(values[i + 1])):
-            continue
-        if values[i] >= values[i - 1] and values[i] >= values[i + 1]:
-            peaks.append(i)
+    core_diameter_px = int(abs(core_hi - core_lo) + 1)
+    height_win = adaptive_rim_height_window(core_diameter_px)
 
+    peaks = []
+    if hi - lo + 1 >= 3:
+        for i in range(lo + 1, hi):
+            if not (np.isfinite(values[i - 1]) and np.isfinite(values[i]) and np.isfinite(values[i + 1])):
+                continue
+            if values[i] >= values[i - 1] and values[i] >= values[i + 1]:
+                peaks.append(i)
+    if not peaks:
+        peaks = [i for i in range(lo, hi + 1) if np.isfinite(values[i])]
     if not peaks:
         return None
 
-    peaks = sorted(peaks, key=lambda i: (abs(i - boundary), -values[i]))
+    peaks = sorted(peaks, key=lambda i: -local_median_height(values, i, height_win))
     return int(peaks[0])
 
 
@@ -592,25 +575,22 @@ def find_rim_candidates_core_then_nearest(values: np.ndarray, side: str,
                                           ext_lo: int, ext_hi: int,
                                           max_candidates: int = MAX_RIM_CANDIDATES) -> List[int]:
     """
-    规则：
-    1) 先只在当前侧 core 半边内找坑顶候选；
-    2) 当前侧 core 边界点作为第一优先候选；
-    3) 只要 core 半边内已有候选，就不再去 core 外找；
-    4) 只有 core 半边内完全没有任何候选时，才到 core 外同侧找“离 core 最近的那个峰”。
+    step2 坑顶候选：
+    1) 先在当前侧 core 半边内找局部峰/最高点；
+    2) 取消“core 边界点第一优先”和“离 core 边界最近优先”；
+    3) 候选按自适应局部高程排序：小坑 1 像元，中坑 3 像元，大坑 5 像元；
+    4) 只有 core 半边内完全没有候选时，才到 core 外同侧补充寻找。
     """
     if side == 'left':
         search_lo, search_hi = core_lo, core_center
-        boundary_idx = core_lo
     else:
         search_lo, search_hi = core_center, core_hi
-        boundary_idx = core_hi
 
+    core_diameter_px = int(abs(int(core_hi) - int(core_lo)) + 1)
     core_candidates = find_local_peak_candidates(
         values, search_lo, search_hi, core_center,
         max_candidates=max_candidates,
-        priority_boundary_idx=boundary_idx,
-        side=side,
-        boundary_window=3,
+        core_diameter_px=core_diameter_px,
     )
     if core_candidates:
         return core_candidates

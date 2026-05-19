@@ -74,6 +74,17 @@ DEFAULT_OUT_DIR = Path(r"Database/CE5/yolo/chickin/basalt_thickness")
 # Basalt criterion. In this project, CF > 8.2 is treated as basalt.
 BASALT_CF_THRESHOLD = 8.2
 
+# Basalt transition rule used in this version.
+# - Basalt is CF > 8.2.
+# - For a basalt rim, the lower boundary is represented by the first inward
+#   non-basalt pixel center (CF <= 8.2), not by the previous basalt pixel.
+# - For a non-basalt rim, the upper boundary is the first inward basalt pixel
+#   center (CF > 8.2), and the lower boundary is the next inward non-basalt
+#   pixel center (CF <= 8.2). A single basalt pixel is still accepted.
+# This constant is kept only for backward-compatible diagnostic columns.
+MAX_CONSECUTIVE_NONBASALT_GAP = 2
+MIN_BASALT_PIXELS_FOR_THICKNESS = 1
+
 # Invalid raster value handling
 INVALID_LOW = -3e10
 MOON_RADIUS_M = 1737400.0
@@ -367,6 +378,9 @@ def build_profile_diagnostics(df: pd.DataFrame, dem_src, cf_src) -> Dict[Tuple[s
             "name": name,
             "profile_type": profile_type,
             "profile_has_two_rims": False,
+            "left_peak_global": np.nan,
+            "right_peak_global": np.nan,
+            "rim_midpoint_global": np.nan,
             "filled_slope_ratio_le1": float(np.nanmax(filled_ratio_vals)) if filled_ratio_vals else np.nan,
             "filled_slope_le1_count": int(max(filled_le_count_vals)) if filled_le_count_vals else 0,
             "filled_slope_valid_count": int(max(filled_valid_count_vals)) if filled_valid_count_vals else 0,
@@ -393,6 +407,10 @@ def build_profile_diagnostics(df: pd.DataFrame, dem_src, cf_src) -> Dict[Tuple[s
         if fixed is None or left_peak_g is None or right_peak_g is None:
             diag[key] = info
             continue
+
+        info["left_peak_global"] = int(left_peak_g)
+        info["right_peak_global"] = int(right_peak_g)
+        info["rim_midpoint_global"] = int(round((float(left_peak_g) + float(right_peak_g)) / 2.0))
 
         start_g = min(left_peak_g, right_peak_g)
         end_g = max(left_peak_g, right_peak_g)
@@ -425,6 +443,10 @@ def build_profile_diagnostics(df: pd.DataFrame, dem_src, cf_src) -> Dict[Tuple[s
 
 
 def sample_peak_to_bottom(dem_src, cf_src, rec: pd.Series):
+    """
+    Legacy helper. Kept for compatibility only.
+    New basalt-thickness extraction uses sample_peak_to_midpoint(), not this function.
+    """
     profile_type = str(rec["profile_type"]).lower()
     fixed = fixed_index_for_record(rec)
     peak_g = index_global_for_record(rec)
@@ -443,15 +465,175 @@ def sample_peak_to_bottom(dem_src, cf_src, rec: pd.Series):
     return dem_vals[:n], cf_vals[:n], rows[:n], cols[:n]
 
 
+def midpoint_global_for_record(rec: pd.Series, profile_info: Dict) -> Optional[int]:
+    """
+    Return the inward search end index.
+
+    Preferred rule: use the midpoint between the two rim/highest points of the
+    current row/col profile.
+
+    Fallback rule: if only one side is available and the two-rim midpoint cannot
+    be defined, use the YOLO/core center line index from the H123 CSV. This
+    prevents otherwise valid one-sided records from being discarded as
+    invalid_peak_to_midpoint_profile.
+    """
+    mid = safe_int(profile_info.get("rim_midpoint_global", np.nan))
+    if mid is not None:
+        return mid
+
+    profile_type = str(rec.get("profile_type", "")).lower()
+    if profile_type == "row":
+        return safe_int(rec.get("center_col", np.nan))
+    if profile_type == "col":
+        return safe_int(rec.get("center_row", np.nan))
+    return None
+
+def sample_peak_to_midpoint(dem_src, cf_src, rec: pd.Series, profile_info: Dict):
+    """
+    Read DEM/CF from one rim peak to the midpoint between the two rim peaks.
+    Direction is preserved: index 0 is always the current rim peak, and the last
+    element is the rim-to-rim midpoint.
+    """
+    profile_type = str(rec["profile_type"]).lower()
+    fixed = fixed_index_for_record(rec)
+    peak_g = index_global_for_record(rec)
+    mid_g = midpoint_global_for_record(rec, profile_info)
+
+    if fixed is None or peak_g is None or mid_g is None:
+        return None
+
+    dem_vals, rows, cols = read_profile_segment(dem_src, profile_type, fixed, peak_g, mid_g)
+    cf_vals, _, _ = read_profile_segment(cf_src, profile_type, fixed, peak_g, mid_g)
+
+    if len(dem_vals) == 0 or len(cf_vals) == 0:
+        return None
+
+    n = min(len(dem_vals), len(cf_vals))
+    return dem_vals[:n], cf_vals[:n], rows[:n], cols[:n], int(mid_g)
+
+
+def depth_from_peak_formula(peak_val: float, h1: float, elev: float) -> float:
+    """
+    Project formula used in previous scripts:
+        depth = 0.8 * ((peak_val - elev) - 0.2 * h1)
+    """
+    return float(0.8 * ((float(peak_val) - float(elev)) - 0.2 * float(h1)))
+
+
+def trace_basalt_interval_until_gap(search_idx, basalt_mask,
+                                    max_gap=MAX_CONSECUTIVE_NONBASALT_GAP,
+                                    start_idx=None):
+    """
+    Trace the first basalt interval along the inward search direction.
+
+    After the first basalt pixel is reached, continue inward only until more
+    than `max_gap` consecutive non-basalt pixels appear. Later basalt pixels
+    after that terminating gap are ignored.
+
+    The returned lower/end basalt boundary is always ``last_basalt``: the last
+    basalt pixel before the terminating non-basalt gap. The first non-basalt
+    pixel of the terminating gap is stored only for diagnostics.
+    """
+    idxs = [int(i) for i in list(search_idx)]
+    out = {
+        "found": False,
+        "first_basalt": np.nan,
+        "last_basalt": np.nan,
+        "basalt_count_in_interval": 0,
+        "terminated_by_gap": False,
+        "stop_gap_first_idx": np.nan,
+        "stop_gap_count": 0,
+        "reached_search_end": False,
+    }
+
+    if start_idx is None:
+        first = None
+        start_pos = None
+        for pos, i in enumerate(idxs):
+            if bool(basalt_mask[i]):
+                first = int(i)
+                start_pos = int(pos)
+                break
+        if first is None:
+            return out
+    else:
+        first = int(start_idx)
+        if first in idxs:
+            start_pos = idxs.index(first)
+        else:
+            idxs = [first] + idxs
+            start_pos = 0
+
+    out["found"] = True
+    out["first_basalt"] = int(first)
+
+    gap_count = 0
+    gap_first = None
+    last_basalt = int(first) if bool(basalt_mask[first]) else None
+    basalt_count = 1 if bool(basalt_mask[first]) else 0
+
+    for i in idxs[start_pos + 1:]:
+        i = int(i)
+        if bool(basalt_mask[i]):
+            last_basalt = int(i)
+            basalt_count += 1
+            gap_count = 0
+            gap_first = None
+        else:
+            if gap_count == 0:
+                gap_first = int(i)
+            gap_count += 1
+            if gap_count > int(max_gap):
+                out["terminated_by_gap"] = True
+                out["stop_gap_first_idx"] = int(gap_first)
+                out["stop_gap_count"] = int(gap_count)
+                break
+
+    if last_basalt is not None:
+        out["last_basalt"] = int(last_basalt)
+    out["basalt_count_in_interval"] = int(basalt_count)
+    out["reached_search_end"] = not bool(out["terminated_by_gap"])
+    if not bool(out["terminated_by_gap"]):
+        out["stop_gap_count"] = int(gap_count)
+        out["stop_gap_first_idx"] = int(gap_first) if gap_first is not None else np.nan
+    return out
+
+
 def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Dict, crater_filled_flag: bool) -> Dict:
+    """
+    Calculate basalt thickness for one direction using the user's corrected
+    midpoint-limited transition rule.
+
+    Search range
+    ------------
+    Current rim peak -> midpoint between the two rim peaks. If the opposite rim
+    is missing, fall back to the profile center from the H123 CSV.
+
+    Basalt rim, peak_cf > 8.2
+    -------------------------
+    Upper boundary: rim peak center.
+    Lower boundary: first inward non-basalt pixel center (CF <= 8.2).
+    If no such non-basalt pixel is reached before the search end, the basalt is
+    treated as unpenetrated and no thickness is output.
+
+    Non-basalt rim, peak_cf <= 8.2
+    ------------------------------
+    Upper boundary: first inward basalt pixel center (CF > 8.2).
+    Lower boundary: first inward non-basalt pixel center after that basalt pixel
+    (CF <= 8.2). A single basalt pixel is still accepted.
+    If no basalt pixel is found, the crater/profile did not reach basalt. If a
+    basalt pixel is found but no following non-basalt pixel is found before the
+    search end, the layer is treated as unpenetrated.
+
+    Filled-crater flags are retained as diagnostic attributes only; they do not
+    exclude records in this version.
+    """
     name = str(rec["name"])
     profile_type = str(rec["profile_type"]).lower()
     side = str(rec["side"]).lower()
 
     peak_row = safe_int(rec.get("peak_row"))
     peak_col = safe_int(rec.get("peak_col"))
-    bottom_row = safe_int(rec.get("bottom_row"))
-    bottom_col = safe_int(rec.get("bottom_col"))
 
     h1 = safe_float(rec.get("h1"))
     peak_val = safe_float(rec.get("peak_val"))
@@ -477,10 +659,46 @@ def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Di
         "profile_between_valid_cf_count": profile_info.get("profile_between_valid_cf_count", 0),
         "profile_between_basalt_count": profile_info.get("profile_between_basalt_count", 0),
         "profile_between_nonbasalt_count": profile_info.get("profile_between_nonbasalt_count", 0),
+        "left_peak_global": profile_info.get("left_peak_global", np.nan),
+        "right_peak_global": profile_info.get("right_peak_global", np.nan),
+        "rim_midpoint_global": profile_info.get("rim_midpoint_global", np.nan),
+        "midpoint_source": "two_rim_midpoint" if np.isfinite(safe_float(profile_info.get("rim_midpoint_global", np.nan))) else "profile_center_fallback",
+        "search_end_global": np.nan,
+        "search_end_row": np.nan,
+        "search_end_col": np.nan,
+        "search_valid_count": 0,
+        "search_basalt_count": 0,
+        "search_nonbasalt_count": 0,
+        "basalt_run_first_idx": np.nan,
+        "basalt_run_last_idx": np.nan,
+        "basalt_run_count": 0,
+        "stop_gap_first_idx": np.nan,
+        "stop_gap_count": 0,
+        "max_nonbasalt_gap_allowed": MAX_CONSECUTIVE_NONBASALT_GAP,
+        "search_limited_to": "rim_peak_to_two_rim_midpoint_or_center_fallback",
+        "upper_boundary_idx": np.nan,
+        "upper_boundary_elev": np.nan,
+        "upper_boundary_row": np.nan,
+        "upper_boundary_col": np.nan,
+        "upper_boundary_cf": np.nan,
+        "lower_boundary_idx": np.nan,
+        "lower_boundary_elev": np.nan,
+        "lower_boundary_row": np.nan,
+        "lower_boundary_col": np.nan,
+        "lower_boundary_cf": np.nan,
         "h_basalt_elev": np.nan,
         "h_basalt_row": np.nan,
         "h_basalt_col": np.nan,
+        "h_basalt_cf": np.nan,
+        "h_basalt_last_elev": np.nan,
+        "h_basalt_last_row": np.nan,
+        "h_basalt_last_col": np.nan,
+        "h_basalt_last_cf": np.nan,
         "h2_basalt": np.nan,
+        "h2_basalt_top": np.nan,
+        "h2_basalt_bottom": np.nan,
+        "basalt_top_depth": np.nan,
+        "basalt_bottom_depth": np.nan,
         "thickness_or_depth": np.nan,
         "thickness_mode": "not_calculated",
         "calculation_status": "not_started",
@@ -490,18 +708,6 @@ def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Di
         "old_h2_to_bottom": old_h2_bottom,
     })
 
-    # Exclusion 1: filled crater/profile
-    if crater_filled_flag:
-        out["calculation_status"] = "excluded_filled_crater"
-        out["thickness_mode"] = "filled_crater_no_cf_calculation"
-        return out
-
-    # Exclusion 2: basalt rim but no penetration; only basalt between the two rims.
-    if bool(profile_info.get("profile_basalt_only_unpenetrated", False)):
-        out["calculation_status"] = "excluded_basalt_only_unpenetrated"
-        out["thickness_mode"] = "basalt_rim_all_between_rims_basalt_no_thickness"
-        return out
-
     if rim_type == "unknown":
         out["calculation_status"] = "invalid_peak_cf"
         return out
@@ -510,174 +716,560 @@ def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Di
         out["calculation_status"] = "invalid_h1_or_peak_val"
         return out
 
-    sampled = sample_peak_to_bottom(dem_src, cf_src, rec)
+    sampled = sample_peak_to_midpoint(dem_src, cf_src, rec, profile_info)
     if sampled is None:
-        out["calculation_status"] = "invalid_peak_to_bottom_profile"
+        out["calculation_status"] = "invalid_peak_to_midpoint_profile"
+        out["contact_note"] = "could not read peak-to-midpoint/profile-center segment; check peak index, fixed row/col, or center fallback"
         return out
 
-    dem_vals, cf_vals, rows, cols = sampled
+    dem_vals, cf_vals, rows, cols, mid_g = sampled
     dem_vals = clean_values(dem_vals, invalid_low=INVALID_LOW, invalid_zero=False)
     cf_vals = clean_values(cf_vals, invalid_low=INVALID_LOW, invalid_zero=False)
 
     valid = np.isfinite(dem_vals) & np.isfinite(cf_vals)
     if np.sum(valid) == 0:
-        out["calculation_status"] = "no_valid_peak_to_bottom_values"
+        out["calculation_status"] = "no_valid_peak_to_midpoint_values"
         return out
 
     basalt_mask = valid & (cf_vals > BASALT_CF_THRESHOLD)
+    search_idx = np.array([i for i in range(1, len(cf_vals)) if valid[i]], dtype=int)
+    search_basalt_idx = np.array([i for i in search_idx if basalt_mask[i]], dtype=int)
+    search_nonbasalt_idx = np.array([i for i in search_idx if valid[i] and not basalt_mask[i]], dtype=int)
 
-    if rim_type == "basalt_rim":
-        # Find the first non-basalt pixel after the basalt rim along the inward profile.
-        # This implements the "next pixel after the last basalt pixel" contact rule.
-        first_nonbasalt = None
-        for i in range(1, len(cf_vals)):
-            if not valid[i]:
+    out.update({
+        "rim_midpoint_global": int(mid_g) if not np.isfinite(safe_float(out.get("rim_midpoint_global", np.nan))) else out.get("rim_midpoint_global"),
+        "search_end_global": int(mid_g),
+        "search_end_row": int(rows[-1]) if len(rows) else np.nan,
+        "search_end_col": int(cols[-1]) if len(cols) else np.nan,
+        "search_valid_count": int(search_idx.size),
+        "search_basalt_count": int(search_basalt_idx.size),
+        "search_nonbasalt_count": int(search_nonbasalt_idx.size),
+    })
+
+    if search_idx.size == 0:
+        out["calculation_status"] = "no_valid_inward_pixels_to_midpoint"
+        out["thickness_mode"] = "no_valid_inward_pixels"
+        return out
+
+    def _first_nonbasalt_after(pos0):
+        for ii in search_idx:
+            ii = int(ii)
+            if ii <= int(pos0):
                 continue
-            if cf_vals[i] <= BASALT_CF_THRESHOLD:
-                first_nonbasalt = i
-                break
+            if valid[ii] and not basalt_mask[ii]:
+                return ii
+        return None
 
-        if first_nonbasalt is None:
-            out["calculation_status"] = "basalt_rim_no_nonbasalt_contact_before_bottom"
-            out["thickness_mode"] = "basalt_rim_contact_not_found"
-            return out
+    def _first_basalt():
+        for ii in search_idx:
+            ii = int(ii)
+            if basalt_mask[ii]:
+                return ii
+        return None
 
-        contact_i = int(first_nonbasalt)
-        h_basalt_elev = float(dem_vals[contact_i])
-        h2_basalt = float(peak_val - h_basalt_elev)
-        thickness = float(0.8 * (h2_basalt - 0.2 * h1))
+    def _set_boundaries(upper_i, lower_i, mode, status, note, use_peak_as_upper=False):
+        if use_peak_as_upper:
+            upper_elev = float(peak_val)
+            upper_row = peak_row
+            upper_col = peak_col
+            upper_cf = float(peak_cf) if np.isfinite(peak_cf) else np.nan
+            upper_depth = 0.0
+        else:
+            upper_elev = float(dem_vals[upper_i])
+            upper_row = int(rows[upper_i])
+            upper_col = int(cols[upper_i])
+            upper_cf = float(cf_vals[upper_i])
+            upper_depth = depth_from_peak_formula(peak_val, h1, upper_elev)
+
+        lower_elev = float(dem_vals[lower_i])
+        lower_row = int(rows[lower_i])
+        lower_col = int(cols[lower_i])
+        lower_cf = float(cf_vals[lower_i])
+        lower_depth = depth_from_peak_formula(peak_val, h1, lower_elev)
+
+        if use_peak_as_upper:
+            thickness = lower_depth
+            h2_top = 0.0
+        else:
+            thickness = abs(lower_depth - upper_depth)
+            h2_top = float(peak_val - upper_elev)
 
         out.update({
-            "h_basalt_elev": h_basalt_elev,
-            "h_basalt_row": int(rows[contact_i]),
-            "h_basalt_col": int(cols[contact_i]),
-            "h2_basalt": h2_basalt,
+            "upper_boundary_idx": int(0 if use_peak_as_upper else upper_i),
+            "upper_boundary_elev": upper_elev,
+            "upper_boundary_row": upper_row,
+            "upper_boundary_col": upper_col,
+            "upper_boundary_cf": upper_cf,
+            "lower_boundary_idx": int(lower_i),
+            "lower_boundary_elev": lower_elev,
+            "lower_boundary_row": lower_row,
+            "lower_boundary_col": lower_col,
+            "lower_boundary_cf": lower_cf,
+            "h_basalt_elev": upper_elev if not use_peak_as_upper else lower_elev,
+            "h_basalt_row": int(upper_row if not use_peak_as_upper else lower_row),
+            "h_basalt_col": int(upper_col if not use_peak_as_upper else lower_col),
+            "h_basalt_cf": float(upper_cf if not use_peak_as_upper else lower_cf),
+            "h_basalt_last_elev": lower_elev,
+            "h_basalt_last_row": lower_row,
+            "h_basalt_last_col": lower_col,
+            "h_basalt_last_cf": lower_cf,
+            "h2_basalt": float(peak_val - lower_elev),
+            "h2_basalt_top": h2_top,
+            "h2_basalt_bottom": float(peak_val - lower_elev),
+            "basalt_top_depth": upper_depth,
+            "basalt_bottom_depth": lower_depth,
             "thickness_or_depth": thickness if thickness >= 0 else np.nan,
-            "thickness_mode": "basalt_rim_thickness",
-            "calculation_status": "ok" if thickness >= 0 else "negative_result_set_nan",
-            "contact_idx_in_peak_to_bottom": contact_i,
-            "contact_cf": float(cf_vals[contact_i]),
-            "contact_note": "first non-basalt pixel after basalt rim; equivalent to next pixel after last basalt pixel",
+            "thickness_mode": mode,
+            "calculation_status": status if thickness >= 0 else "negative_result_set_nan",
+            "contact_idx_in_peak_to_bottom": int(lower_i if use_peak_as_upper else upper_i),
+            "contact_cf": float(lower_cf if use_peak_as_upper else upper_cf),
+            "contact_note": note,
         })
         return out
 
-    # nonbasalt rim: find the first basalt pixel from rim inward.
-    first_basalt = None
-    for i in range(1, len(cf_vals)):
-        if basalt_mask[i]:
-            first_basalt = i
-            break
+    # -----------------------------
+    # Case A. Rim peak is basalt.
+    # -----------------------------
+    if rim_type == "basalt_rim":
+        lower_i = None
+        for ii in search_idx:
+            ii = int(ii)
+            if valid[ii] and not basalt_mask[ii]:
+                lower_i = ii
+                break
 
+        out.update({
+            "basalt_run_first_idx": 0,
+            "basalt_run_last_idx": int(lower_i - 1) if lower_i is not None and lower_i > 0 else np.nan,
+            "basalt_run_count": int(np.sum(basalt_mask[:lower_i])) if lower_i is not None else int(np.sum(basalt_mask)),
+            "stop_gap_first_idx": int(lower_i) if lower_i is not None else np.nan,
+            "stop_gap_count": 1 if lower_i is not None else 0,
+        })
+
+        if lower_i is None:
+            out["calculation_status"] = "excluded_basalt_unpenetrated_to_midpoint"
+            out["thickness_mode"] = "basalt_rim_no_nonbasalt_to_midpoint"
+            out["contact_note"] = "basalt rim; no inward CF<=threshold pixel before midpoint/profile-center fallback, so lower boundary was not reached"
+            return out
+
+        return _set_boundaries(
+            upper_i=0,
+            lower_i=lower_i,
+            mode="basalt_rim_thickness_first_nonbasalt_center",
+            status="ok",
+            note="basalt rim; lower boundary uses the center elevation of the first inward non-basalt pixel (CF<=threshold)",
+            use_peak_as_upper=True,
+        )
+
+    # -----------------------------
+    # Case B. Rim peak is not basalt.
+    # -----------------------------
+    first_basalt = _first_basalt()
     if first_basalt is None:
-        out["calculation_status"] = "no_basalt_detected_from_rim_to_bottom"
-        out["thickness_mode"] = "no_basalt_detected"
+        out["calculation_status"] = "no_basalt_detected_to_midpoint"
+        out["thickness_mode"] = "no_basalt_detected_before_midpoint"
+        out["contact_note"] = "non-basalt rim; no inward CF>threshold pixel before midpoint/profile-center fallback"
         return out
 
-    contact_i = int(first_basalt)
-    h_basalt_elev = float(dem_vals[contact_i])
-    h2_basalt = float(peak_val - h_basalt_elev)
-    burial_depth = float(0.8 * (h2_basalt - 0.2 * h1))
+    lower_i = _first_nonbasalt_after(first_basalt)
 
     out.update({
-        "h_basalt_elev": h_basalt_elev,
-        "h_basalt_row": int(rows[contact_i]),
-        "h_basalt_col": int(cols[contact_i]),
-        "h2_basalt": h2_basalt,
-        "thickness_or_depth": burial_depth if burial_depth >= 0 else np.nan,
-        "thickness_mode": "nonbasalt_rim_burial_depth",
-        "calculation_status": "ok" if burial_depth >= 0 else "negative_result_set_nan",
-        "contact_idx_in_peak_to_bottom": contact_i,
-        "contact_cf": float(cf_vals[contact_i]),
-        "contact_note": "first basalt pixel from non-basalt rim inward",
+        "basalt_run_first_idx": int(first_basalt),
+        "basalt_run_last_idx": int(first_basalt if lower_i is not None else (search_basalt_idx[-1] if search_basalt_idx.size else first_basalt)),
+        "basalt_run_count": int(np.sum([basalt_mask[ii] for ii in search_idx if ii >= first_basalt and (lower_i is None or ii < lower_i)])),
+        "stop_gap_first_idx": int(lower_i) if lower_i is not None else np.nan,
+        "stop_gap_count": 1 if lower_i is not None else 0,
     })
-    return out
 
+    if lower_i is None:
+        out.update({
+            "upper_boundary_idx": int(first_basalt),
+            "upper_boundary_elev": float(dem_vals[first_basalt]),
+            "upper_boundary_row": int(rows[first_basalt]),
+            "upper_boundary_col": int(cols[first_basalt]),
+            "upper_boundary_cf": float(cf_vals[first_basalt]),
+            "h_basalt_elev": float(dem_vals[first_basalt]),
+            "h_basalt_row": int(rows[first_basalt]),
+            "h_basalt_col": int(cols[first_basalt]),
+            "h_basalt_cf": float(cf_vals[first_basalt]),
+            "h2_basalt_top": float(peak_val - float(dem_vals[first_basalt])),
+            "basalt_top_depth": depth_from_peak_formula(peak_val, h1, float(dem_vals[first_basalt])),
+            "contact_idx_in_peak_to_bottom": int(first_basalt),
+            "contact_cf": float(cf_vals[first_basalt]),
+            "thickness_mode": "nonbasalt_rim_basalt_reaches_midpoint_no_lower_boundary",
+            "calculation_status": "excluded_basalt_unpenetrated_to_midpoint",
+            "contact_note": "non-basalt rim; basalt upper boundary was found, but no following CF<=threshold pixel before midpoint/profile-center fallback, so lower boundary was not reached",
+        })
+        return out
+
+    return _set_boundaries(
+        upper_i=first_basalt,
+        lower_i=lower_i,
+        mode="nonbasalt_rim_thickness_first_basalt_to_first_nonbasalt_center",
+        status="ok",
+        note="non-basalt rim; upper boundary uses first inward basalt pixel center (CF>threshold), lower boundary uses the following first inward non-basalt pixel center (CF<=threshold); one-pixel basalt intervals are retained",
+        use_peak_as_upper=False,
+    )
 
 def attach_felsic_felsic_profile_thickness(records_df: pd.DataFrame) -> pd.DataFrame:
     """
-    If both left and right directions of the same name+profile are nonbasalt-rim burial-depth cases,
-    calculate profile true thickness as abs(depth_right - depth_left).
+    Kept for backward compatibility.
 
-    This follows the old CalculateUnitPixel.py logic but makes the two-step formula explicit:
-      h_begin = 0.8 * ((Hrim_left - Hbasalt_left) - 0.2*h1_left)
-      h_end   = 0.8 * ((Hrim_right - Hbasalt_right) - 0.2*h1_right)
-      t_basalt = abs(h_end - h_begin)
+    Earlier versions calculated profile_t_basalt only when both sides were
+    nonbasalt_rim_burial_depth. After the 2026-05 midpoint revision, a non-basalt
+    rim direction directly calculates true thickness from the first and last
+    basalt pixels before the two-rim midpoint. Therefore profile_t_basalt is no
+    longer needed as the main thickness field.
     """
     df = records_df.copy()
-    df["profile_t_basalt"] = np.nan
-    df["profile_t_basalt_status"] = ""
-
-    for key, sub in df.groupby(["name", "profile_type"], sort=False):
-        left = sub[sub["side"].eq("left")]
-        right = sub[sub["side"].eq("right")]
-        if left.empty or right.empty:
-            continue
-
-        li = left.index[0]
-        ri = right.index[0]
-        left_mode = str(df.loc[li, "thickness_mode"])
-        right_mode = str(df.loc[ri, "thickness_mode"])
-
-        if left_mode == "nonbasalt_rim_burial_depth" and right_mode == "nonbasalt_rim_burial_depth":
-            dl = safe_float(df.loc[li, "thickness_or_depth"])
-            dr = safe_float(df.loc[ri, "thickness_or_depth"])
-            if np.isfinite(dl) and np.isfinite(dr):
-                t = abs(dr - dl)
-                df.loc[[li, ri], "profile_t_basalt"] = t
-                df.loc[[li, ri], "profile_t_basalt_status"] = "felsic_felsic_true_thickness_from_depth_difference"
-            else:
-                df.loc[[li, ri], "profile_t_basalt_status"] = "felsic_felsic_but_invalid_depth"
+    if "profile_t_basalt" not in df.columns:
+        df["profile_t_basalt"] = np.nan
+    if "profile_t_basalt_status" not in df.columns:
+        df["profile_t_basalt_status"] = "not_used_after_midpoint_revision"
     return df
 
 
-def write_point_shp(df: pd.DataFrame, out_shp: Path, cf_src):
+def attach_h3_h3t_relative_error(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add h3/h3t relative-error diagnostics following nihechengtu.m:
+        rel_err = abs(h3 - h3t) / ((h3 + h3t) / 2)
+
+    rel_err is stored as a fraction; rel_err_pct is percent. Records with
+    rel_err >= 0.20 are removed from basalt_thickness_points.shp, while
+    all_basalt_points.shp keeps all records.
+    """
+    out = df.copy()
+    h3 = pd.to_numeric(out.get("h3", np.nan), errors="coerce")
+    h3t = pd.to_numeric(out.get("h3t", np.nan), errors="coerce")
+    thk = pd.to_numeric(out.get("thickness_or_depth", np.nan), errors="coerce")
+    denom = (h3 + h3t) / 2.0
+    valid = np.isfinite(h3) & np.isfinite(h3t) & np.isfinite(denom) & (denom != 0)
+    rel_err = pd.Series(np.nan, index=out.index, dtype=float)
+    rel_err.loc[valid] = np.abs(h3.loc[valid] - h3t.loc[valid]) / denom.loc[valid]
+    out["h3_h3t_rel_err"] = rel_err
+    out["h3_h3t_rel_err_pct"] = rel_err * 100.0
+    out["h3_h3t_pass20"] = valid & np.isfinite(thk) & (rel_err < 0.20)
+    return out
+
+
+def fit_h3_vs_h3t_r2(df: pd.DataFrame) -> Dict[str, float]:
+    x = pd.to_numeric(df.get("h3t", np.nan), errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(df.get("h3", np.nan), errors="coerce").to_numpy(dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+    if x.size < 2 or np.nanstd(y) == 0:
+        return {"n": int(x.size), "slope": np.nan, "intercept": np.nan, "r2": np.nan}
+    p = np.polyfit(x, y, 1)
+    yfit = np.polyval(p, x)
+    ss_res = float(np.sum((y - yfit) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = float(1.0 - ss_res / ss_tot) if ss_tot != 0 else np.nan
+    return {"n": int(x.size), "slope": float(p[0]), "intercept": float(p[1]), "r2": r2}
+
+
+def write_point_shp(df: pd.DataFrame, out_shp: Path, cf_src, only_pass20: bool = False):
+    """
+    Write point shapefile.
+
+    all_basalt_points.shp:
+      - all direction records; thk_dep may be NULL.
+    basalt_thickness_points.shp:
+      - only records with true thickness not NULL and h3/h3t relative error <20%.
+
+    Geometry is always written at the rim peak (peak_row/peak_col), not at the
+    basalt contact point. Contact rows/cols are stored only as attributes.
+    """
     if not HAS_GPD:
         print("geopandas/shapely unavailable; skip shapefile output.")
         return
 
-    rows = []
+    use_df = df.copy()
+    if only_pass20:
+        if "h3_h3t_pass20" not in use_df.columns:
+            use_df = attach_h3_h3t_relative_error(use_df)
+        use_df = use_df[use_df["h3_h3t_pass20"].astype(bool)].copy()
+
+    rows_out = []
     xs = []
     ys = []
 
-    for _, r in df.iterrows():
-        rr = safe_int(r.get("h_basalt_row", np.nan))
-        cc = safe_int(r.get("h_basalt_col", np.nan))
-        if rr is None or cc is None:
-            rr = safe_int(r.get("peak_row", np.nan))
-            cc = safe_int(r.get("peak_col", np.nan))
+    for _, r in use_df.iterrows():
+        rr = safe_int(r.get("peak_row", np.nan))
+        cc = safe_int(r.get("peak_col", np.nan))
         if rr is None or cc is None:
             continue
 
         x, y = cf_src.xy(rr, cc)
         row = r.to_dict()
 
-        # Shapefile field names are limited; write the full CSV as authoritative.
+        # Shapefile field names are limited to 10 characters.
+        # Full details are preserved in the CSV outputs.
         keep = {
-            "name": str(row.get("name", "")),
-            "ptype": str(row.get("profile_type", "")),
-            "side": str(row.get("side", "")),
+            "name": str(row.get("name", ""))[:80],
+            "ptype": str(row.get("profile_type", ""))[:12],
+            "side": str(row.get("side", ""))[:12],
             "status": str(row.get("calculation_status", ""))[:40],
             "mode": str(row.get("thickness_mode", ""))[:40],
             "rimtype": str(row.get("rim_type_new", ""))[:20],
             "pk_cf": safe_float(row.get("peak_cf")),
             "thk_dep": safe_float(row.get("thickness_or_depth")),
-            "t_prof": safe_float(row.get("profile_t_basalt")),
-            "filled": int(bool(row.get("crater_filled_flag", False))),
-            "unpen": int(bool(row.get("profile_basalt_only_unpenetrated", False))),
+            "h3": safe_float(row.get("h3")),
+            "h3t": safe_float(row.get("h3t")),
+            "err_pct": safe_float(row.get("h3_h3t_rel_err_pct")),
+            "pass20": int(bool(row.get("h3_h3t_pass20", False))),
+            "top_dep": safe_float(row.get("basalt_top_depth")),
+            "bot_dep": safe_float(row.get("basalt_bottom_depth")),
+            "run_n": safe_float(row.get("basalt_run_count")),
+            "gap_n": safe_float(row.get("stop_gap_count")),
+            "up_r": safe_float(row.get("upper_boundary_row")),
+            "up_c": safe_float(row.get("upper_boundary_col")),
+            "lo_r": safe_float(row.get("lower_boundary_row")),
+            "lo_c": safe_float(row.get("lower_boundary_col")),
+            "ct_r": safe_float(row.get("h_basalt_row")),
+            "ct_c": safe_float(row.get("h_basalt_col")),
+            "ct2_r": safe_float(row.get("h_basalt_last_row")),
+            "ct2_c": safe_float(row.get("h_basalt_last_col")),
+            "mid_g": safe_float(row.get("rim_midpoint_global")),
+            "filled": int(safe_bool(row.get("crater_filled_flag", False), False)),
+            "pfilled": int(safe_bool(row.get("profile_filled_flag", False), False)),
+            "unpen": int("unpenetrated" in str(row.get("calculation_status", "")).lower()),
         }
-        rows.append(keep)
+        rows_out.append(keep)
         xs.append(x)
         ys.append(y)
 
-    if not rows:
-        print("No point records for shapefile output.")
+    if not rows_out:
+        print(f"No point records for shapefile output: {out_shp}")
         return
 
-    gdf = gpd.GeoDataFrame(rows, geometry=[Point(x, y) for x, y in zip(xs, ys)], crs=cf_src.crs)
+    gdf = gpd.GeoDataFrame(rows_out, geometry=[Point(x, y) for x, y in zip(xs, ys)], crs=cf_src.crs)
     out_shp.parent.mkdir(parents=True, exist_ok=True)
     gdf.to_file(out_shp, driver="ESRI Shapefile", encoding="utf-8")
     print(f"Point SHP saved: {out_shp}")
 
+
+
+# ============================================================
+# Crater-level robust aggregation of direction-level thickness
+# ============================================================
+def direction_field_name(profile_type: str, side: str) -> Optional[str]:
+    """
+    Map the four direction records to original direction fields in the crater-level output.
+
+    row-left  -> row_left
+    row-right -> row_right
+    col-left  -> col_left
+    col-right -> col_right
+
+    Hyphens are avoided because shapefile field names should use underscores.
+    """
+    p = str(profile_type).lower()
+    s = str(side).lower()
+    if p == "row" and s == "left":
+        return "row_left"
+    if p == "row" and s == "right":
+        return "row_right"
+    if p == "col" and s == "left":
+        return "col_left"
+    if p == "col" and s == "right":
+        return "col_right"
+    return None
+
+
+def aggregate_crater_thickness_values(values,
+                                      spread_threshold=0.60,
+                                      outlier_threshold=0.80,
+                                      ge10_threshold=10.0):
+    """
+    Aggregate 1-4 direction-level thickness estimates into one crater-level value.
+
+    Rules:
+      1) One valid direction: keep it.
+      2) If exactly one value is >=10 and all remaining values are <10, keep that value.
+      3) If relative spread is small, average all values.
+         relative_spread = (max - min) / median.
+      4) If n>=3 and values are scattered, remove strong outliers relative to the median.
+         If the remaining values are consistent, average them; otherwise use their median.
+      5) If n=2 and inconsistent, use the median and mark it as inconsistent.
+
+    Returns:
+      final_thickness, used_mask, flag
+    """
+    vals = np.asarray(values, dtype=float)
+    finite = np.isfinite(vals)
+    vals_valid = vals[finite]
+
+    used_mask = np.zeros(vals.shape, dtype=bool)
+    if vals_valid.size == 0:
+        return np.nan, used_mask, "none"
+
+    valid_positions = np.where(finite)[0]
+
+    def _rel_spread(arr):
+        arr = np.asarray(arr, dtype=float)
+        arr = arr[np.isfinite(arr)]
+        if arr.size == 0:
+            return np.inf
+        med = float(np.nanmedian(arr))
+        if not np.isfinite(med) or abs(med) < 1e-12:
+            return 0.0 if float(np.nanmax(arr) - np.nanmin(arr)) == 0 else np.inf
+        return float((np.nanmax(arr) - np.nanmin(arr)) / abs(med))
+
+    if vals_valid.size == 1:
+        used_mask[valid_positions[0]] = True
+        return float(vals_valid[0]), used_mask, "one"
+
+    ge10 = vals_valid >= float(ge10_threshold)
+    if int(np.sum(ge10)) == 1 and np.all(vals_valid[~ge10] < float(ge10_threshold)):
+        pos_in_valid = int(np.where(ge10)[0][0])
+        used_mask[valid_positions[pos_in_valid]] = True
+        return float(vals_valid[pos_in_valid]), used_mask, "ge10"
+
+    if _rel_spread(vals_valid) <= float(spread_threshold):
+        used_mask[finite] = True
+        return float(np.nanmean(vals_valid)), used_mask, "avg"
+
+    if vals_valid.size >= 3:
+        med = float(np.nanmedian(vals_valid))
+        if np.isfinite(med) and abs(med) >= 1e-12:
+            rel_dev = np.abs(vals_valid - med) / abs(med)
+            keep_valid = rel_dev <= float(outlier_threshold)
+        else:
+            keep_valid = np.ones(vals_valid.shape, dtype=bool)
+
+        # Avoid deleting almost everything. If fewer than two values remain,
+        # keep the two values closest to the median.
+        if int(np.sum(keep_valid)) < 2 and vals_valid.size >= 2:
+            order = np.argsort(np.abs(vals_valid - med))
+            keep_valid[:] = False
+            keep_valid[order[:2]] = True
+
+        vals2 = vals_valid[keep_valid]
+        used_positions = valid_positions[keep_valid]
+        used_mask[used_positions] = True
+
+        if vals2.size == 0:
+            return np.nan, used_mask, "none"
+        if vals2.size == 1:
+            return float(vals2[0]), used_mask, "rm_one"
+        if _rel_spread(vals2) <= float(spread_threshold):
+            return float(np.nanmean(vals2)), used_mask, "rm_avg"
+        return float(np.nanmedian(vals2)), used_mask, "rm_med"
+
+    # n == 2 and inconsistent: do not decide which one is wrong automatically.
+    used_mask[finite] = True
+    return float(np.nanmedian(vals_valid)), used_mask, "inc2"
+
+
+def write_crater_summary_shp(direction_df: pd.DataFrame, out_shp: Path, cf_src):
+    """
+    Write one crater-level shapefile with a compact but useful attribute table.
+
+    Existing direction-level shapefiles are not modified:
+      - all_basalt_points.shp
+      - basalt_thickness_points.shp
+
+    New output:
+      - basalt_thickness_crater_summary.shp
+
+    Fields:
+      name       crater name
+      final_thk  robust crater-level thickness
+      row_right  row-right direction thickness, if available
+      col_right  col-right direction thickness, if available
+      row_left   row-left direction thickness, if available
+      col_left   col-left direction thickness, if available
+      n_used     number of directions used to calculate final_thk
+      flag       aggregation rule
+    """
+    if not HAS_GPD:
+        print("geopandas/shapely unavailable; skip crater summary shapefile output.")
+        return
+
+    if direction_df is None or direction_df.empty:
+        print(f"No direction records for crater summary shapefile output: {out_shp}")
+        return
+
+    df = direction_df.copy()
+    if "h3_h3t_pass20" in df.columns:
+        df = df[df["h3_h3t_pass20"].astype(bool)].copy()
+    df["_thk"] = pd.to_numeric(df.get("thickness_or_depth", np.nan), errors="coerce")
+    df = df[np.isfinite(df["_thk"])].copy()
+
+    if df.empty:
+        print(f"No valid thickness records for crater summary shapefile output: {out_shp}")
+        return
+
+    rows_out = []
+    geoms = []
+    direction_order = ["row_right", "col_right", "row_left", "col_left"]
+
+    for name, sub in df.groupby("name", sort=False):
+        # Direction fields are left blank if that direction is absent or invalid.
+        dir_values = {k: np.nan for k in direction_order}
+        dir_rows = {k: [] for k in direction_order}
+
+        for idx, r in sub.iterrows():
+            dname = direction_field_name(r.get("profile_type", ""), r.get("side", ""))
+            if dname is None:
+                continue
+            thk = safe_float(r.get("_thk", np.nan))
+            if not np.isfinite(thk):
+                continue
+            dir_rows[dname].append((idx, thk))
+
+        # If duplicate records appear in any direction, average within that direction.
+        for dname, items in dir_rows.items():
+            if items:
+                dir_values[dname] = float(np.nanmean([v for _, v in items]))
+
+        vals = np.array([dir_values[d] for d in direction_order], dtype=float)
+        final_thk, used_mask, flag = aggregate_crater_thickness_values(vals)
+        if not np.isfinite(final_thk):
+            continue
+
+        # Geometry: use crater center when available. If not, use mean peak position
+        # from the valid direction records.
+        cr = pd.to_numeric(sub.get("center_row", np.nan), errors="coerce")
+        cc = pd.to_numeric(sub.get("center_col", np.nan), errors="coerce")
+        valid_center = np.isfinite(cr) & np.isfinite(cc)
+        if np.any(valid_center):
+            rr = int(round(float(cr[valid_center].iloc[0])))
+            col = int(round(float(cc[valid_center].iloc[0])))
+        else:
+            pr = pd.to_numeric(sub.get("peak_row", np.nan), errors="coerce")
+            pc = pd.to_numeric(sub.get("peak_col", np.nan), errors="coerce")
+            valid_peak = np.isfinite(pr) & np.isfinite(pc)
+            if not np.any(valid_peak):
+                continue
+            rr = int(round(float(np.nanmean(pr[valid_peak]))))
+            col = int(round(float(np.nanmean(pc[valid_peak]))))
+
+        if rr < 0 or rr >= cf_src.height or col < 0 or col >= cf_src.width:
+            continue
+
+        x, y = cf_src.xy(rr, col)
+        rows_out.append({
+            "name": str(name)[:80],
+            "final_thk": float(final_thk),
+            "row_right": safe_float(dir_values["row_right"]),
+            "col_right": safe_float(dir_values["col_right"]),
+            "row_left": safe_float(dir_values["row_left"]),
+            "col_left": safe_float(dir_values["col_left"]),
+            "n_used": int(np.sum(used_mask)),
+            "flag": str(flag)[:12],
+        })
+        geoms.append(Point(x, y))
+
+    if not rows_out:
+        print(f"No crater summary records for shapefile output: {out_shp}")
+        return
+
+    gdf = gpd.GeoDataFrame(rows_out, geometry=geoms, crs=cf_src.crs)
+    out_shp.parent.mkdir(parents=True, exist_ok=True)
+    gdf.to_file(out_shp, driver="ESRI Shapefile", encoding="utf-8")
+    print(f"Crater summary SHP saved: {out_shp}")
 
 def main():
     parser = argparse.ArgumentParser(description="Calculate CE5 basalt thickness from H123 CSV + DEM + CF.")
@@ -714,8 +1306,8 @@ def main():
         profile_diag = build_profile_diagnostics(h123, dem_src, cf_src)
 
         # Filled flags are inherited from the H123 CSVs. This script does not recalculate
-        # the filled-crater slope criterion. If any record/profile for a crater has
-        # crater_filled_flag or profile_filled_flag, all directions of that crater are skipped.
+        # the filled-crater slope criterion. From this version onward filled flags are
+        # diagnostic only; they DO NOT exclude records from thickness calculation.
         crater_filled = {}
         for name, sub in h123.groupby("name", sort=False):
             flags = []
@@ -734,11 +1326,14 @@ def main():
 
         out_df = pd.DataFrame(records)
         out_df = attach_felsic_felsic_profile_thickness(out_df)
+        out_df = attach_h3_h3t_relative_error(out_df)
 
         annotated_csv = out_dir / "h123_with_filled_and_basalt_flags.csv"
         thickness_csv = out_dir / "basalt_thickness_direction_records.csv"
         summary_csv = out_dir / "basalt_thickness_crater_profile_summary.csv"
-        out_shp = out_dir / "basalt_thickness_points.shp"
+        all_shp = out_dir / "all_basalt_points.shp"
+        filtered_shp = out_dir / "basalt_thickness_points.shp"
+        crater_summary_shp = out_dir / "basalt_thickness_crater_summary.shp"
 
         out_df.to_csv(thickness_csv, index=False, encoding="utf-8-sig")
 
@@ -748,8 +1343,19 @@ def main():
             "crater_filled_flag", "profile_filled_flag", "filled_slope_ratio_le1",
             "profile_basalt_only_unpenetrated", "profile_all_between_basalt",
             "peak_cf", "rim_type_new", "calculation_status", "thickness_mode",
-            "h1", "h2", "h2_basalt", "thickness_or_depth", "profile_t_basalt",
-            "peak_row", "peak_col", "bottom_row", "bottom_col", "h_basalt_row", "h_basalt_col"
+            "h1", "h2", "h3", "h3t", "h3_h3t_rel_err_pct", "h3_h3t_pass20",
+            "left_peak_global", "right_peak_global", "rim_midpoint_global", "midpoint_source",
+            "search_end_global", "search_valid_count", "search_basalt_count", "search_nonbasalt_count",
+            "basalt_run_first_idx", "basalt_run_last_idx", "basalt_run_count",
+            "stop_gap_first_idx", "stop_gap_count", "max_nonbasalt_gap_allowed",
+            "upper_boundary_idx", "upper_boundary_elev", "upper_boundary_row", "upper_boundary_col", "upper_boundary_cf",
+            "lower_boundary_idx", "lower_boundary_elev", "lower_boundary_row", "lower_boundary_col", "lower_boundary_cf",
+            "h2_basalt", "h2_basalt_top", "h2_basalt_bottom",
+            "basalt_top_depth", "basalt_bottom_depth", "thickness_or_depth", "profile_t_basalt",
+            "peak_row", "peak_col", "bottom_row", "bottom_col",
+            "h_basalt_row", "h_basalt_col", "h_basalt_cf",
+            "h_basalt_last_row", "h_basalt_last_col", "h_basalt_last_cf",
+            "contact_note"
         ]
         for c in flag_cols:
             if c not in out_df.columns:
@@ -776,11 +1382,28 @@ def main():
             })
         pd.DataFrame(summary_rows).to_csv(summary_csv, index=False, encoding="utf-8-sig")
 
-        write_point_shp(out_df, out_shp, cf_src)
+        write_point_shp(out_df, all_shp, cf_src, only_pass20=False)
+        filtered_df = out_df[out_df["h3_h3t_pass20"].astype(bool)].copy()
+        write_point_shp(out_df, filtered_shp, cf_src, only_pass20=True)
+        write_crater_summary_shp(filtered_df, crater_summary_shp, cf_src)
+
+        fit_info = fit_h3_vs_h3t_r2(filtered_df)
+        print("\n========== h3 vs h3t filter summary ==========")
+        print("Relative error formula: abs(h3 - h3t) / ((h3 + h3t) / 2)")
+        print("Filter rule: keep true thk_dep not NULL and relative error < 20%; remove relative error >= 20%")
+        print(f"All direction records: {len(out_df)}")
+        print(f"Kept direction records: {len(filtered_df)}")
+        print(f"Removed direction records: {len(out_df) - len(filtered_df)}")
+        print(f"Filtered fit: h3 = {fit_info['slope']:.6f} * h3t + {fit_info['intercept']:.6f}")
+        print(f"Filtered R2: {fit_info['r2']:.6f}  (n = {fit_info['n']})")
+        print("=============================================\n")
 
     print(f"Annotated CSV saved: {annotated_csv}")
     print(f"Thickness direction CSV saved: {thickness_csv}")
     print(f"Profile summary CSV saved: {summary_csv}")
+    print(f"All point SHP saved: {all_shp}")
+    print(f"Filtered thickness SHP saved: {filtered_shp}")
+    print(f"Crater summary SHP saved: {crater_summary_shp}")
     print("Done.")
 
 

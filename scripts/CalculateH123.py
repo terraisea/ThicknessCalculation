@@ -1,3 +1,4 @@
+# MODIFIED_FOR_RIM_PEAK_2026_05_12: adaptive 1/3/5 rim-height scoring; core-boundary preference cancelled; SHP points use rim peaks.
 
 import argparse
 import math
@@ -629,6 +630,44 @@ def find_local_peaks(values, lo, hi):
     return peaks
 
 
+def adaptive_rim_height_window(core_diameter_px):
+    """
+    Adaptive height window for rim scoring.
+
+    DEM resolution in the CE5 area is roughly several hundred meters per pixel.
+    A fixed 5-pixel median window is too large for sub-kilometer to small-kilometer
+    craters, so rim height is evaluated in three levels:
+      <=12 px : single-pixel elevation, preserving small crater rims;
+      13-40 px: 3-pixel local median;
+      >40 px : 5-pixel local median for larger craters.
+    """
+    try:
+        dpx = int(round(float(core_diameter_px)))
+    except Exception:
+        dpx = 0
+    if dpx <= 12:
+        return 1
+    if dpx <= 40:
+        return 3
+    return 5
+
+
+def local_median_height(values, idx, win):
+    """Return single-pixel height or local median height around idx."""
+    idx = int(idx)
+    win = int(max(1, win))
+    if win <= 1:
+        return float(values[idx]) if 0 <= idx < len(values) and np.isfinite(values[idx]) else np.nan
+    half = win // 2
+    lo = max(0, idx - half)
+    hi = min(len(values) - 1, idx + half)
+    seg = np.asarray(values[lo:hi + 1], dtype=float)
+    seg = seg[np.isfinite(seg)]
+    if seg.size == 0:
+        return np.nan
+    return float(np.nanmedian(seg))
+
+
 def rim_inflection_score(values, slopes, idx, side, lo, hi, win=3):
     """
     拐点 + 局部峰联合评分：
@@ -664,36 +703,37 @@ def rim_inflection_score(values, slopes, idx, side, lo, hi, win=3):
 
 def find_rim_idx(values, slopes, side, core_start_idx, core_end_idx, center_idx):
     """
-    在 core 半边内找 rim 候选：
-    1) 先找局部峰；
-    2) 要求 inner slope > outer slope；
-    3) 用加权评分选择最终 rim：
-       Score = 0.45*坡折强度 + 0.30*相对高程差 + 0.15*距中心远近 + 0.10*突出度
+    在 core 半边内识别坑顶 rim。
 
-    这里“相对高程差”不是直接用 DEM 绝对高程，
-    而是用 候选峰高程 - 当前半边平均高程。
+    本版取消“靠近 core 边界优先/限制”的逻辑，不再按离 core 边界远近排序。
+    坑顶仍需优先满足局部峰形（^ 形）和内外坡折关系；在候选排序中加入
+    自适应局部高程：小坑用单像元，中等坑用 3 像元中位数，大坑用 5 像元中位数。
+
+    Score = 0.35*坡折强度 + 0.45*自适应相对高程 + 0.10*距中心远近 + 0.10*突出度
     """
     if side == "left":
         lo, hi = core_start_idx, center_idx
-        seg_vals = np.asarray(values[lo:center_idx + 1], dtype=float)
     else:
         lo, hi = center_idx, core_end_idx
-        seg_vals = np.asarray(values[center_idx:hi + 1], dtype=float)
 
     lo = max(0, int(lo))
     hi = min(len(values) - 1, int(hi))
     if hi < lo:
         return None
 
-    seg_vals = seg_vals[np.isfinite(seg_vals)]
-    if seg_vals.size == 0:
-        segment_mean = 0.0
-    else:
-        segment_mean = float(np.nanmean(seg_vals))
+    core_diameter_px = int(abs(int(core_end_idx) - int(core_start_idx)) + 1)
+    height_win = adaptive_rim_height_window(core_diameter_px)
+
+    seg_idx = [i for i in range(lo, hi + 1) if np.isfinite(values[i])]
+    if not seg_idx:
+        return None
+    seg_heights = np.asarray([local_median_height(values, i, height_win) for i in seg_idx], dtype=float)
+    seg_heights = seg_heights[np.isfinite(seg_heights)]
+    segment_mean = float(np.nanmean(seg_heights)) if seg_heights.size else 0.0
 
     peaks = find_local_peaks(values, lo, hi)
     if not peaks:
-        peaks = [i for i in range(lo, hi + 1) if np.isfinite(values[i])]
+        peaks = seg_idx
     if not peaks:
         return None
 
@@ -702,25 +742,33 @@ def find_rim_idx(values, slopes, side, core_start_idx, core_end_idx, center_idx)
         if not np.isfinite(values[i]):
             continue
 
+        smooth_height = local_median_height(values, i, height_win)
+        if not np.isfinite(smooth_height):
+            continue
+
         slope_break, prominence = rim_inflection_score(values, slopes, i, side, lo, hi, win=3)
         if not np.isfinite(slope_break):
             continue
+        # 保留“内侧坡度大于外侧坡度”的 ^ 型坑顶约束；若不满足则不作为首选候选。
         if slope_break <= 0:
             continue
 
         center_dist = abs(i - center_idx)
-        height_rel = float(values[i] - segment_mean)
+        height_rel = float(smooth_height - segment_mean)
 
         cand.append({
             "idx": int(i),
             "slope_break": float(slope_break),
             "height_rel": float(height_rel),
+            "smooth_height": float(smooth_height),
             "prominence": float(prominence),
             "dist": float(center_dist),
+            "height_window_px": int(height_win),
         })
 
     if not cand:
-        peaks = sorted(peaks, key=lambda i: (-values[i], -abs(i - center_idx)))
+        # 如果没有满足坡折约束的局部峰，则退化为当前半边内自适应局部高程最高的点。
+        peaks = sorted(peaks, key=lambda i: (-local_median_height(values, i, height_win), -abs(i - center_idx)))
         return int(peaks[0])
 
     def norm(arr):
@@ -740,13 +788,13 @@ def find_rim_idx(values, slopes, side, core_start_idx, core_end_idx, center_idx)
 
     for k, c in enumerate(cand):
         c["score"] = (
-            0.45 * slope_n[k] +
-            0.30 * height_n[k] +
-            0.15 * dist_n[k] +
+            0.35 * slope_n[k] +
+            0.45 * height_n[k] +
+            0.10 * dist_n[k] +
             0.10 * prom_n[k]
         )
 
-    cand.sort(key=lambda d: (-d["score"], -d["height_rel"], -d["slope_break"]))
+    cand.sort(key=lambda d: (-d["score"], -d["smooth_height"], -d["slope_break"]))
     return int(cand[0]["idx"])
 
 
