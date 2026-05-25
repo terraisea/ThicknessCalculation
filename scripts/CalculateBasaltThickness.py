@@ -16,8 +16,10 @@ Main updates relative to the old CalculateUnitPixel.py
    CalculateH123.py and ExtendCalculateH123.py.
 4. Unpenetrated basalt case is added:
    if both rims are basalt and all valid pixels between the two rims are basalt, the crater/profile
-   is marked as basalt_only_unpenetrated and no thickness is calculated.
-5. The script writes annotated CSV outputs and an optional point shapefile.
+   is marked as basalt_only_unpenetrated; in the original three outputs, H3T is used as the direction-level thickness.
+5. An extra old-method crater-summary shapefile is written after excluding H3T-derived unpenetrated basalt directions,
+   so it can be used as a cleaner interpolation input.
+6. The script writes annotated CSV outputs and point/crater shapefiles.
 
 Expected inputs
 ---------------
@@ -84,6 +86,34 @@ BASALT_CF_THRESHOLD = 8.2
 # This constant is kept only for backward-compatible diagnostic columns.
 MAX_CONSECUTIVE_NONBASALT_GAP = 2
 MIN_BASALT_PIXELS_FOR_THICKNESS = 1
+
+# Crater-level aggregation thresholds.
+# These two values come from the MATLAB IQR upper-fence statistics:
+#   relative_spread_threshold = Q3 + 1.5 * IQR = 3.442
+#   rel_dev_threshold         = Q3 + 1.5 * IQR = 2.011
+# relative_spread is only a trigger for direction-level outlier checking;
+# it does NOT remove the whole crater.
+# rel_dev is used to identify direction-level outliers.
+RELATIVE_SPREAD_THRESHOLD = 3.442
+REL_DEV_THRESHOLD = 2.011
+
+# User rule for unpenetrated/full-basalt profiles:
+# if a basalt profile reaches the midpoint without a non-basalt lower boundary,
+# use H3T as the direction-level thickness.
+# This is kept for the original three outputs:
+#   all_basalt_points.shp
+#   basalt_thickness_points.shp
+#   basalt_thickness_crater_summary.shp
+USE_H3T_FOR_UNPENETRATED_BASALT = True
+
+# Additional old-method comparison output:
+# create one extra crater-level shapefile that discards direction records
+# whose thickness was supplied from H3T for an unpenetrated basalt case.
+# This keeps the original three shapefiles unchanged and provides an
+# interpolation input that does not use artificial H3T thickness for
+# all-basalt / unpenetrated-basalt profiles.
+WRITE_OLDMETHOD_NO_H3T_UNPENETRATED_SUMMARY = True
+OLDMETHOD_EXCLUDED_THICKNESS_SOURCE = "h3t_for_unpenetrated_basalt"
 
 # Invalid raster value handling
 INVALID_LOW = -3e10
@@ -614,7 +644,7 @@ def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Di
     Upper boundary: rim peak center.
     Lower boundary: first inward non-basalt pixel center (CF <= 8.2).
     If no such non-basalt pixel is reached before the search end, the basalt is
-    treated as unpenetrated and no thickness is output.
+    treated as unpenetrated; this version uses H3T as the direction-level thickness.
 
     Non-basalt rim, peak_cf <= 8.2
     ------------------------------
@@ -623,7 +653,7 @@ def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Di
     (CF <= 8.2). A single basalt pixel is still accepted.
     If no basalt pixel is found, the crater/profile did not reach basalt. If a
     basalt pixel is found but no following non-basalt pixel is found before the
-    search end, the layer is treated as unpenetrated.
+    search end, the layer is treated as unpenetrated; this version uses H3T as the direction-level thickness.
 
     Filled-crater flags are retained as diagnostic attributes only; they do not
     exclude records in this version.
@@ -706,7 +736,44 @@ def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Di
         "contact_cf": np.nan,
         "contact_note": "",
         "old_h2_to_bottom": old_h2_bottom,
+        "cf_class": out.get("cf_class", "unknown"),
+        "thk_ok": int(safe_bool(out.get("thk_ok", False), False)),
+        "unpenetrated_flag": int(safe_bool(out.get("unpenetrated_flag", False), False)),
+        "thickness_source": "cf_transition",
     })
+
+    def _use_h3t_as_unpenetrated_thickness(mode: str, note: str):
+        """
+        User rule: for all-basalt / unpenetrated basalt profiles, use H3T as
+        thickness_or_depth. The record is kept as a valid direction-level
+        thickness record while still carrying the unpenetrated flag.
+        """
+        h3t_val = safe_float(rec.get("h3t", np.nan))
+        class_name = "unpenetrated_all_basalt" if bool(profile_info.get("profile_basalt_only_unpenetrated", False)) else "unpenetrated_basalt_rim"
+
+        if np.isfinite(h3t_val) and h3t_val > 0:
+            out.update({
+                "thickness_or_depth": float(h3t_val),
+                "thickness_mode": mode,
+                "calculation_status": "ok",
+                "cf_class": class_name,
+                "thk_ok": 1,
+                "unpenetrated_flag": 1,
+                "thickness_source": "h3t_for_unpenetrated_basalt",
+                "contact_note": note,
+            })
+        else:
+            out.update({
+                "thickness_or_depth": np.nan,
+                "thickness_mode": mode,
+                "calculation_status": "invalid_h3t_for_unpenetrated_basalt",
+                "cf_class": class_name,
+                "thk_ok": 0,
+                "unpenetrated_flag": 1,
+                "thickness_source": "h3t_for_unpenetrated_basalt_failed",
+                "contact_note": note + "; h3t is invalid, so thickness_or_depth remains NaN",
+            })
+        return out
 
     if rim_type == "unknown":
         out["calculation_status"] = "invalid_peak_cf"
@@ -847,9 +914,17 @@ def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Di
         })
 
         if lower_i is None:
+            if USE_H3T_FOR_UNPENETRATED_BASALT:
+                return _use_h3t_as_unpenetrated_thickness(
+                    mode="basalt_rim_unpenetrated_h3t_thickness",
+                    note="basalt rim; no inward CF<=threshold pixel before midpoint/profile-center fallback; user rule uses h3t as thickness",
+                )
             out["calculation_status"] = "excluded_basalt_unpenetrated_to_midpoint"
             out["thickness_mode"] = "basalt_rim_no_nonbasalt_to_midpoint"
             out["contact_note"] = "basalt rim; no inward CF<=threshold pixel before midpoint/profile-center fallback, so lower boundary was not reached"
+            out["cf_class"] = "unpenetrated_all_basalt" if bool(profile_info.get("profile_basalt_only_unpenetrated", False)) else "unpenetrated_basalt_rim"
+            out["unpenetrated_flag"] = 1
+            out["thk_ok"] = 0
             return out
 
         return _set_boundaries(
@@ -896,9 +971,19 @@ def calculate_direction_record(dem_src, cf_src, rec: pd.Series, profile_info: Di
             "basalt_top_depth": depth_from_peak_formula(peak_val, h1, float(dem_vals[first_basalt])),
             "contact_idx_in_peak_to_bottom": int(first_basalt),
             "contact_cf": float(cf_vals[first_basalt]),
+        })
+        if USE_H3T_FOR_UNPENETRATED_BASALT:
+            return _use_h3t_as_unpenetrated_thickness(
+                mode="nonbasalt_rim_unpenetrated_h3t_thickness",
+                note="non-basalt rim; basalt upper boundary was found, but no following CF<=threshold pixel before midpoint/profile-center fallback; user rule uses h3t as thickness",
+            )
+        out.update({
             "thickness_mode": "nonbasalt_rim_basalt_reaches_midpoint_no_lower_boundary",
             "calculation_status": "excluded_basalt_unpenetrated_to_midpoint",
             "contact_note": "non-basalt rim; basalt upper boundary was found, but no following CF<=threshold pixel before midpoint/profile-center fallback, so lower boundary was not reached",
+            "cf_class": "unpenetrated_basalt_rim",
+            "unpenetrated_flag": 1,
+            "thk_ok": 0,
         })
         return out
 
@@ -1033,7 +1118,9 @@ def write_point_shp(df: pd.DataFrame, out_shp: Path, cf_src, only_pass20: bool =
             "mid_g": safe_float(row.get("rim_midpoint_global")),
             "filled": int(safe_bool(row.get("crater_filled_flag", False), False)),
             "pfilled": int(safe_bool(row.get("profile_filled_flag", False), False)),
-            "unpen": int("unpenetrated" in str(row.get("calculation_status", "")).lower()),
+            "unpen": int(safe_bool(row.get("unpenetrated_flag", False), False) or
+                         ("unpenetrated" in str(row.get("calculation_status", "")).lower()) or
+                         ("unpenetrated" in str(row.get("thickness_mode", "")).lower())),
         }
         rows_out.append(keep)
         xs.append(x)
@@ -1078,20 +1165,30 @@ def direction_field_name(profile_type: str, side: str) -> Optional[str]:
 
 
 def aggregate_crater_thickness_values(values,
-                                      spread_threshold=0.60,
-                                      outlier_threshold=0.80,
+                                      spread_threshold=RELATIVE_SPREAD_THRESHOLD,
+                                      outlier_threshold=REL_DEV_THRESHOLD,
                                       ge10_threshold=10.0):
     """
     Aggregate 1-4 direction-level thickness estimates into one crater-level value.
 
-    Rules:
+    User-defined rules in this version:
       1) One valid direction: keep it.
-      2) If exactly one value is >=10 and all remaining values are <10, keep that value.
-      3) If relative spread is small, average all values.
+      2) If relative_spread is not large, average all valid directions.
          relative_spread = (max - min) / median.
-      4) If n>=3 and values are scattered, remove strong outliers relative to the median.
-         If the remaining values are consistent, average them; otherwise use their median.
-      5) If n=2 and inconsistent, use the median and mark it as inconsistent.
+      3) If n == 2 and relative_spread is large, keep the larger value and
+         discard the smaller value.
+      4) If n >= 3 and relative_spread is large, calculate leave-one rel_dev:
+             rel_dev_i = abs(T_i - median(other directions)) / median(other directions).
+         Only the most outlying direction is considered.
+         - if the most outlying value is the minimum value, discard it and
+           average the remaining directions;
+         - if the most outlying value is the maximum value, do not discard it;
+           average all directions;
+         - if no rel_dev exceeds the threshold, average all directions and flag it.
+
+    Important:
+      relative_spread is only a trigger for checking direction inconsistency.
+      It does NOT remove a whole crater.
 
     Returns:
       final_thickness, used_mask, flag
@@ -1116,50 +1213,73 @@ def aggregate_crater_thickness_values(values,
             return 0.0 if float(np.nanmax(arr) - np.nanmin(arr)) == 0 else np.inf
         return float((np.nanmax(arr) - np.nanmin(arr)) / abs(med))
 
+    # Rule 1: one direction only.
     if vals_valid.size == 1:
         used_mask[valid_positions[0]] = True
         return float(vals_valid[0]), used_mask, "one"
 
-    ge10 = vals_valid >= float(ge10_threshold)
-    if int(np.sum(ge10)) == 1 and np.all(vals_valid[~ge10] < float(ge10_threshold)):
-        pos_in_valid = int(np.where(ge10)[0][0])
-        used_mask[valid_positions[pos_in_valid]] = True
-        return float(vals_valid[pos_in_valid]), used_mask, "ge10"
-
+    # Rule 2: directions are not strongly scattered, use all directions.
     if _rel_spread(vals_valid) <= float(spread_threshold):
         used_mask[finite] = True
         return float(np.nanmean(vals_valid)), used_mask, "avg"
 
+    # Rule 3: two directions with large discrepancy.
+    # User rule: remove the smaller value and keep the larger value.
+    if vals_valid.size == 2:
+        max_pos_in_valid = int(np.nanargmax(vals_valid))
+        used_mask[valid_positions[max_pos_in_valid]] = True
+        return float(vals_valid[max_pos_in_valid]), used_mask, "two_keepmax"
+
+    # Rule 4: n >= 3 with large discrepancy.
+    # Use leave-one rel_dev, then only handle the single most outlying direction.
     if vals_valid.size >= 3:
-        med = float(np.nanmedian(vals_valid))
-        if np.isfinite(med) and abs(med) >= 1e-12:
-            rel_dev = np.abs(vals_valid - med) / abs(med)
-            keep_valid = rel_dev <= float(outlier_threshold)
-        else:
+        rel_dev = np.full(vals_valid.shape, np.nan, dtype=float)
+        for i in range(vals_valid.size):
+            others = np.delete(vals_valid, i)
+            med_other = float(np.nanmedian(others))
+            if np.isfinite(med_other) and abs(med_other) >= 1e-12:
+                rel_dev[i] = abs(vals_valid[i] - med_other) / abs(med_other)
+
+        finite_dev = np.isfinite(rel_dev)
+        if not np.any(finite_dev):
+            used_mask[finite] = True
+            return float(np.nanmean(vals_valid)), used_mask, "avg_nodev"
+
+        worst_pos = int(np.nanargmax(rel_dev))
+        worst_dev = float(rel_dev[worst_pos])
+
+        # If no direction exceeds rel_dev_threshold, do not remove any direction.
+        if worst_dev <= float(outlier_threshold):
+            used_mask[finite] = True
+            return float(np.nanmean(vals_valid)), used_mask, "avg_noout"
+
+        worst_val = float(vals_valid[worst_pos])
+        min_val = float(np.nanmin(vals_valid))
+        max_val = float(np.nanmax(vals_valid))
+        tol = 1e-12
+
+        if abs(worst_val - min_val) <= tol:
+            # User rule: if the outlier is the minimum, remove it.
             keep_valid = np.ones(vals_valid.shape, dtype=bool)
+            keep_valid[worst_pos] = False
+            used_mask[valid_positions[keep_valid]] = True
+            vals2 = vals_valid[keep_valid]
+            if vals2.size == 0:
+                return np.nan, used_mask, "none"
+            return float(np.nanmean(vals2)), used_mask, "rm_min_avg"
 
-        # Avoid deleting almost everything. If fewer than two values remain,
-        # keep the two values closest to the median.
-        if int(np.sum(keep_valid)) < 2 and vals_valid.size >= 2:
-            order = np.argsort(np.abs(vals_valid - med))
-            keep_valid[:] = False
-            keep_valid[order[:2]] = True
+        if abs(worst_val - max_val) <= tol:
+            # User rule: if the outlier is the maximum, keep it and average all directions.
+            used_mask[finite] = True
+            return float(np.nanmean(vals_valid)), used_mask, "max_avg"
 
-        vals2 = vals_valid[keep_valid]
-        used_positions = valid_positions[keep_valid]
-        used_mask[used_positions] = True
+        # Rare fallback: the most outlying direction is neither the min nor the max.
+        # Keep all directions and use the average to avoid deleting an ambiguous middle value.
+        used_mask[finite] = True
+        return float(np.nanmean(vals_valid)), used_mask, "mid_avg"
 
-        if vals2.size == 0:
-            return np.nan, used_mask, "none"
-        if vals2.size == 1:
-            return float(vals2[0]), used_mask, "rm_one"
-        if _rel_spread(vals2) <= float(spread_threshold):
-            return float(np.nanmean(vals2)), used_mask, "rm_avg"
-        return float(np.nanmedian(vals2)), used_mask, "rm_med"
-
-    # n == 2 and inconsistent: do not decide which one is wrong automatically.
     used_mask[finite] = True
-    return float(np.nanmedian(vals_valid)), used_mask, "inc2"
+    return float(np.nanmean(vals_valid)), used_mask, "avg"
 
 
 def write_crater_summary_shp(direction_df: pd.DataFrame, out_shp: Path, cf_src):
@@ -1271,6 +1391,40 @@ def write_crater_summary_shp(direction_df: pd.DataFrame, out_shp: Path, cf_src):
     gdf.to_file(out_shp, driver="ESRI Shapefile", encoding="utf-8")
     print(f"Crater summary SHP saved: {out_shp}")
 
+
+def filter_oldmethod_no_h3t_unpenetrated(df: pd.DataFrame) -> Tuple[pd.DataFrame, int]:
+    """
+    Build the old-method comparison dataset.
+
+    The current main workflow may set thickness_or_depth = h3t for
+    unpenetrated basalt profiles, with:
+        thickness_source == "h3t_for_unpenetrated_basalt"
+
+    For the extra old-method crater-summary shapefile, these records are
+    removed before crater-level aggregation. This does not change the original
+    three shapefile outputs.
+
+    Returns
+    -------
+    filtered_df, removed_count
+    """
+    if df is None or df.empty:
+        return df.copy(), 0
+
+    out = df.copy()
+    if "thickness_source" in out.columns:
+        source = out["thickness_source"].astype(str).str.lower().str.strip()
+        exclude = source.eq(OLDMETHOD_EXCLUDED_THICKNESS_SOURCE.lower())
+    else:
+        # Fallback for old CSVs without thickness_source.
+        mode = out.get("thickness_mode", pd.Series("", index=out.index)).astype(str).str.lower()
+        status = out.get("calculation_status", pd.Series("", index=out.index)).astype(str).str.lower()
+        unpen = out.get("unpenetrated_flag", pd.Series(False, index=out.index)).apply(lambda v: safe_bool(v, False))
+        exclude = (unpen.astype(bool) | mode.str.contains("unpenetrated") | status.str.contains("unpenetrated"))
+
+    removed_count = int(exclude.sum())
+    return out.loc[~exclude].copy(), removed_count
+
 def main():
     parser = argparse.ArgumentParser(description="Calculate CE5 basalt thickness from H123 CSV + DEM + CF.")
     parser.add_argument("--dem", default=str(DEFAULT_DEM), help="DEM raster path")
@@ -1334,6 +1488,8 @@ def main():
         all_shp = out_dir / "all_basalt_points.shp"
         filtered_shp = out_dir / "basalt_thickness_points.shp"
         crater_summary_shp = out_dir / "basalt_thickness_crater_summary.shp"
+        oldmethod_crater_summary_shp = out_dir / "basalt_thickness_crater_summary_oldmethod.shp"
+        oldmethod_direction_csv = out_dir / "basalt_thickness_direction_records_oldmethod_no_h3t.csv"
 
         out_df.to_csv(thickness_csv, index=False, encoding="utf-8-sig")
 
@@ -1355,6 +1511,7 @@ def main():
             "peak_row", "peak_col", "bottom_row", "bottom_col",
             "h_basalt_row", "h_basalt_col", "h_basalt_cf",
             "h_basalt_last_row", "h_basalt_last_col", "h_basalt_last_cf",
+            "cf_class", "thk_ok", "unpenetrated_flag", "thickness_source",
             "contact_note"
         ]
         for c in flag_cols:
@@ -1387,6 +1544,14 @@ def main():
         write_point_shp(out_df, filtered_shp, cf_src, only_pass20=True)
         write_crater_summary_shp(filtered_df, crater_summary_shp, cf_src)
 
+        if WRITE_OLDMETHOD_NO_H3T_UNPENETRATED_SUMMARY:
+            oldmethod_filtered_df, oldmethod_removed_n = filter_oldmethod_no_h3t_unpenetrated(filtered_df)
+            oldmethod_filtered_df.to_csv(oldmethod_direction_csv, index=False, encoding="utf-8-sig")
+            write_crater_summary_shp(oldmethod_filtered_df, oldmethod_crater_summary_shp, cf_src)
+        else:
+            oldmethod_filtered_df = filtered_df.copy()
+            oldmethod_removed_n = 0
+
         fit_info = fit_h3_vs_h3t_r2(filtered_df)
         print("\n========== h3 vs h3t filter summary ==========")
         print("Relative error formula: abs(h3 - h3t) / ((h3 + h3t) / 2)")
@@ -1396,6 +1561,12 @@ def main():
         print(f"Removed direction records: {len(out_df) - len(filtered_df)}")
         print(f"Filtered fit: h3 = {fit_info['slope']:.6f} * h3t + {fit_info['intercept']:.6f}")
         print(f"Filtered R2: {fit_info['r2']:.6f}  (n = {fit_info['n']})")
+        if WRITE_OLDMETHOD_NO_H3T_UNPENETRATED_SUMMARY:
+            print("\n========== old-method no-H3T-unpenetrated summary ==========")
+            print(f"Removed H3T-derived unpenetrated direction records: {oldmethod_removed_n}")
+            print(f"Remaining direction records for old-method summary: {len(oldmethod_filtered_df)}")
+            print(f"Old-method crater summary SHP: {oldmethod_crater_summary_shp}")
+            print("==========================================================")
         print("=============================================\n")
 
     print(f"Annotated CSV saved: {annotated_csv}")
@@ -1404,6 +1575,9 @@ def main():
     print(f"All point SHP saved: {all_shp}")
     print(f"Filtered thickness SHP saved: {filtered_shp}")
     print(f"Crater summary SHP saved: {crater_summary_shp}")
+    if WRITE_OLDMETHOD_NO_H3T_UNPENETRATED_SUMMARY:
+        print(f"Old-method no-H3T crater summary SHP saved: {oldmethod_crater_summary_shp}")
+        print(f"Old-method direction CSV saved: {oldmethod_direction_csv}")
     print("Done.")
 
 

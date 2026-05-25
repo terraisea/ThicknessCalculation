@@ -46,6 +46,7 @@ BASALT_FLAG_COLS = [
     'contact_idx', 'contact_global', 'contact_row', 'contact_col', 'contact_cf',
     'h_basalt_elev', 'h2_basalt', 'thickness_or_depth',
     'thickness_mode', 'basalt_contact_status', 'contact_note',
+    'cf_class', 'thk_ok', 'unpenetrated_flag', 'cf_class_note',
 ]
 
 # =========================
@@ -1099,6 +1100,13 @@ def attach_basalt_contact_columns(records, cf_values, dem_values, profile_type, 
         rec['thickness_mode'] = 'not_calculated'
         rec['basalt_contact_status'] = 'not_started'
         rec['contact_note'] = ''
+        # CF-based classification fields.
+        # thk_ok=1 only means this side has a computable basalt thickness/burial-depth value.
+        # unpenetrated_flag=1 means basalt was detected but no lower non-basalt boundary was reached.
+        rec['cf_class'] = 'unknown'
+        rec['thk_ok'] = 0
+        rec['unpenetrated_flag'] = 0
+        rec['cf_class_note'] = ''
 
         if cf_values is None or len(cf_values) == 0:
             rec['basalt_contact_status'] = 'missing_cf_profile'
@@ -1120,8 +1128,17 @@ def attach_basalt_contact_columns(records, cf_values, dem_values, profile_type, 
         rec['rim_type_new'] = 'basalt_rim' if rim_is_basalt else 'nonbasalt_rim'
 
         if int(profile_basalt_info.get('basalt_only_unpenetrated_flag', 0)) == 1:
-            rec['thickness_mode'] = 'basalt_rim_all_between_rims_basalt_no_thickness'
-            rec['basalt_contact_status'] = 'excluded_basalt_only_unpenetrated'
+            # This is a valid CF class, not a calculation error:
+            # both rims are basalt and all valid pixels between the two rims are basalt.
+            # The crater/profile reached basalt but did not penetrate to a non-basalt lower boundary,
+            # so no deterministic thickness is reported here.
+            rec['cf_class'] = 'unpenetrated_all_basalt'
+            rec['thk_ok'] = 0
+            rec['unpenetrated_flag'] = 1
+            rec['thickness_mode'] = 'unpenetrated_all_basalt_no_thickness'
+            rec['basalt_contact_status'] = 'unpenetrated_all_basalt'
+            rec['contact_note'] = 'kept as CF class: all valid between-rim CF pixels are basalt; no non-basalt lower boundary'
+            rec['cf_class_note'] = 'all basalt between rims; unpenetrated; not used as deterministic thickness'
             continue
 
         if bottom_idx is None or bottom_idx < 0 or bottom_idx >= len(cf_values):
@@ -1144,9 +1161,15 @@ def attach_basalt_contact_columns(records, cf_values, dem_values, profile_type, 
                     contact_i = int(ii)
                     break
             if contact_i is None:
+                rec['cf_class'] = 'unpenetrated_basalt_rim'
+                rec['thk_ok'] = 0
+                rec['unpenetrated_flag'] = 1
                 rec['thickness_mode'] = 'basalt_rim_contact_not_found'
                 rec['basalt_contact_status'] = 'basalt_rim_no_nonbasalt_contact_before_bottom'
+                rec['contact_note'] = 'basalt rim, but no inward non-basalt contact was found before the calculation bottom'
+                rec['cf_class_note'] = 'basalt detected but lower boundary not reached; not used as deterministic thickness'
                 continue
+            rec['cf_class'] = 'penetrated_basalt_rim'
             rec['thickness_mode'] = 'basalt_rim_thickness'
             rec['contact_note'] = 'first non-basalt pixel after basalt rim; next pixel after last basalt pixel'
         else:
@@ -1155,9 +1178,14 @@ def attach_basalt_contact_columns(records, cf_values, dem_values, profile_type, 
                     contact_i = int(ii)
                     break
             if contact_i is None:
+                rec['cf_class'] = 'no_basalt_detected'
+                rec['thk_ok'] = 0
+                rec['unpenetrated_flag'] = 0
                 rec['thickness_mode'] = 'no_basalt_detected'
                 rec['basalt_contact_status'] = 'no_basalt_detected_from_rim_to_bottom'
+                rec['cf_class_note'] = 'non-basalt rim and no basalt pixel detected inward'
                 continue
+            rec['cf_class'] = 'buried_basalt_detected'
             rec['thickness_mode'] = 'nonbasalt_rim_burial_depth'
             rec['contact_note'] = 'first basalt pixel from non-basalt rim inward'
 
@@ -1192,7 +1220,10 @@ def attach_basalt_contact_columns(records, cf_values, dem_values, profile_type, 
         rec['h_basalt_elev'] = h_basalt_elev
         rec['h2_basalt'] = h2_basalt
         rec['thickness_or_depth'] = thickness_or_depth if thickness_or_depth >= 0 else np.nan
+        rec['thk_ok'] = int(thickness_or_depth >= 0)
         rec['basalt_contact_status'] = 'ok' if thickness_or_depth >= 0 else 'negative_result_set_nan'
+        if thickness_or_depth < 0:
+            rec['cf_class_note'] = 'negative calculated value; thickness_or_depth set to NaN'
 
 def inherit_filled_columns(out_rec: Optional[Dict], src_rec) -> Optional[Dict]:
     """
@@ -1221,8 +1252,11 @@ def inherit_filled_columns(out_rec: Optional[Dict], src_rec) -> Optional[Dict]:
         elif c in ('basalt_cf_threshold', 'peak_cf', 'left_rim_cf', 'right_rim_cf', 'contact_idx', 'contact_global',
                    'contact_row', 'contact_col', 'contact_cf', 'h_basalt_elev', 'h2_basalt', 'thickness_or_depth'):
             out_rec[c] = np.nan
-        elif c in ('rim_type_new', 'thickness_mode', 'basalt_contact_status', 'contact_note', 'basalt_profile_reason'):
+        elif c in ('rim_type_new', 'thickness_mode', 'basalt_contact_status', 'contact_note', 'basalt_profile_reason',
+                   'cf_class', 'cf_class_note'):
             out_rec[c] = ''
+        elif c in ('thk_ok', 'unpenetrated_flag'):
+            out_rec[c] = 0
         else:
             out_rec[c] = np.nan
     return out_rec
@@ -1355,6 +1389,7 @@ def run(dem_path: Path, cf_path: Path, shp_path: Path, step1_reject_csv: Path, o
         'contact_idx', 'contact_global', 'contact_row', 'contact_col', 'contact_cf',
         'h_basalt_elev', 'h2_basalt', 'thickness_or_depth',
         'thickness_mode', 'basalt_contact_status', 'contact_note',
+        'cf_class', 'thk_ok', 'unpenetrated_flag', 'cf_class_note',
         'line_dem_row', 'line_dem_col',
         'center_row', 'center_col',
         'core_start_global', 'core_end_global',
