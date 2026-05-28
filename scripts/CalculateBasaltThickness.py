@@ -97,6 +97,24 @@ MIN_BASALT_PIXELS_FOR_THICKNESS = 1
 RELATIVE_SPREAD_THRESHOLD = 3.442
 REL_DEV_THRESHOLD = 2.011
 
+# Data-driven thresholds used by the sequential low-tail aggregation rule.
+# These values were derived from the current Thickness.csv / crater-summary
+# direction-thickness distribution:
+#   n == 2:
+#       pair_ratio = min(T1,T2) / max(T1,T2)
+#       Otsu automatic threshold = 0.496
+#   n >= 3:
+#       low_ratio = min_value / median(other directions)
+#       Otsu automatic threshold = 0.477
+#
+# The sequential low-tail rule uses PAIR_RATIO_THRESHOLD and LOW_RATIO_THRESHOLD.
+# HIGH_PAIR_DIFF_THRESHOLD is kept only for backward compatibility with older
+# function signatures/comments; the revised sequential rule does not require
+# the two high values to be close before removing a clearly low-tail value.
+PAIR_RATIO_THRESHOLD = 0.496
+LOW_RATIO_THRESHOLD = 0.477
+HIGH_PAIR_DIFF_THRESHOLD = 0.569
+
 # User rule for unpenetrated/full-basalt profiles:
 # if a basalt profile reaches the midpoint without a non-basalt lower boundary,
 # use H3T as the direction-level thickness.
@@ -1167,31 +1185,69 @@ def direction_field_name(profile_type: str, side: str) -> Optional[str]:
 def aggregate_crater_thickness_values(values,
                                       spread_threshold=RELATIVE_SPREAD_THRESHOLD,
                                       outlier_threshold=REL_DEV_THRESHOLD,
+                                      pair_ratio_threshold=PAIR_RATIO_THRESHOLD,
+                                      low_ratio_threshold=LOW_RATIO_THRESHOLD,
+                                      high_pair_diff_threshold=HIGH_PAIR_DIFF_THRESHOLD,
                                       ge10_threshold=10.0):
     """
     Aggregate 1-4 direction-level thickness estimates into one crater-level value.
 
-    User-defined rules in this version:
-      1) One valid direction: keep it.
-      2) If relative_spread is not large, average all valid directions.
-         relative_spread = (max - min) / median.
-      3) If n == 2 and relative_spread is large, keep the larger value and
-         discard the smaller value.
-      4) If n >= 3 and relative_spread is large, calculate leave-one rel_dev:
-             rel_dev_i = abs(T_i - median(other directions)) / median(other directions).
-         Only the most outlying direction is considered.
-         - if the most outlying value is the minimum value, discard it and
-           average the remaining directions;
-         - if the most outlying value is the maximum value, do not discard it;
-           average all directions;
-         - if no rel_dev exceeds the threshold, average all directions and flag it.
+    Revised rule: sequential low-tail filtering.
 
-    Important:
-      relative_spread is only a trigger for checking direction inconsistency.
-      It does NOT remove a whole crater.
+    Rationale
+    ---------
+    The previous local-consensus rule required two conditions at the same time:
+        low_ratio <= 0.477
+        high_pair_diff <= 0.569
 
-    Returns:
-      final_thickness, used_mask, flag
+    This was too conservative for cases such as [79.5, 29.7, 0.7]. The smallest
+    value is clearly a low-tail estimate, but the two remaining values are not
+    close enough to satisfy high_pair_diff. For crater thickness estimates,
+    directional thickness can vary laterally, so the two higher values do not
+    have to form a tight pair before a clearly low value is removed.
+
+    Data-driven thresholds
+    ----------------------
+    pair_ratio_threshold = 0.496
+        Derived from Otsu automatic separation of min/max ratios among two-direction
+        craters in Thickness.csv.
+
+    low_ratio_threshold = 0.477
+        Derived from Otsu automatic separation of low_ratio among multi-direction
+        craters in Thickness.csv.
+
+    Rules
+    -----
+    1) n = 1:
+       keep the only valid direction.
+
+    2) n = 2:
+       pair_ratio = min(T1,T2) / max(T1,T2).
+       If pair_ratio <= 0.496, keep only the larger value.
+       Otherwise, average the two values.
+
+    3) n >= 3:
+       Compute:
+           low_ratio = min_value / median(other directions)
+
+       If low_ratio <= 0.477, remove the minimum value and repeat the check on
+       the remaining directions. This allows multiple clearly low directions to
+       be removed one after another.
+
+       After low-tail filtering:
+         - if two values remain, apply the same pair_ratio rule again;
+         - if three or more values remain and no more low-tail value is detected,
+           average all remaining values unless the fallback IQR/rel_dev rule is triggered.
+
+    Important
+    ---------
+    This rule only removes low-tail direction values. It does not remove high
+    direction values. In the fallback rule, if the most deviant value is the
+    maximum, all values are still kept and averaged.
+
+    Returns
+    -------
+    final_thickness, used_mask, flag
     """
     vals = np.asarray(values, dtype=float)
     finite = np.isfinite(vals)
@@ -1201,7 +1257,9 @@ def aggregate_crater_thickness_values(values,
     if vals_valid.size == 0:
         return np.nan, used_mask, "none"
 
-    valid_positions = np.where(finite)[0]
+    current_vals = vals_valid.copy()
+    current_positions = np.where(finite)[0].copy()
+    removed_low_count = 0
 
     def _rel_spread(arr):
         arr = np.asarray(arr, dtype=float)
@@ -1213,74 +1271,103 @@ def aggregate_crater_thickness_values(values,
             return 0.0 if float(np.nanmax(arr) - np.nanmin(arr)) == 0 else np.inf
         return float((np.nanmax(arr) - np.nanmin(arr)) / abs(med))
 
-    # Rule 1: one direction only.
-    if vals_valid.size == 1:
-        used_mask[valid_positions[0]] = True
-        return float(vals_valid[0]), used_mask, "one"
+    def _use_current(flag_name):
+        used_mask[current_positions] = True
+        return float(np.nanmean(current_vals)), used_mask, flag_name
 
-    # Rule 2: directions are not strongly scattered, use all directions.
-    if _rel_spread(vals_valid) <= float(spread_threshold):
-        used_mask[finite] = True
-        return float(np.nanmean(vals_valid)), used_mask, "avg"
+    while True:
+        n = current_vals.size
 
-    # Rule 3: two directions with large discrepancy.
-    # User rule: remove the smaller value and keep the larger value.
-    if vals_valid.size == 2:
-        max_pos_in_valid = int(np.nanargmax(vals_valid))
-        used_mask[valid_positions[max_pos_in_valid]] = True
-        return float(vals_valid[max_pos_in_valid]), used_mask, "two_keepmax"
+        # Rule 1: one direction only.
+        if n == 1:
+            used_mask[current_positions[0]] = True
+            if removed_low_count > 0:
+                return float(current_vals[0]), used_mask, "rm_low_to_one"
+            return float(current_vals[0]), used_mask, "one"
 
-    # Rule 4: n >= 3 with large discrepancy.
-    # Use leave-one rel_dev, then only handle the single most outlying direction.
-    if vals_valid.size >= 3:
-        rel_dev = np.full(vals_valid.shape, np.nan, dtype=float)
-        for i in range(vals_valid.size):
-            others = np.delete(vals_valid, i)
+        # Rule 2: two directions. Apply this both for original n=2 and after
+        # removing one or more low-tail values from n>=3.
+        if n == 2:
+            min_val = float(np.nanmin(current_vals))
+            max_val = float(np.nanmax(current_vals))
+            pair_ratio = min_val / max_val if max_val > 0 else 1.0
+
+            if pair_ratio <= float(pair_ratio_threshold):
+                max_pos_in_current = int(np.nanargmax(current_vals))
+                used_mask[current_positions[max_pos_in_current]] = True
+                if removed_low_count > 0:
+                    return float(current_vals[max_pos_in_current]), used_mask, "rm_low_two_keepmax"
+                return float(current_vals[max_pos_in_current]), used_mask, "two_keepmax"
+
+            if removed_low_count > 0:
+                return _use_current("rm_low_then_two_avg")
+            return _use_current("two_avg")
+
+        # Rule 3A: n >= 3. Remove clear low-tail values sequentially.
+        min_pos = int(np.nanargmin(current_vals))
+        min_val = float(current_vals[min_pos])
+        other_vals = np.delete(current_vals, min_pos)
+        med_other = float(np.nanmedian(other_vals))
+
+        if np.isfinite(med_other) and abs(med_other) >= 1e-12:
+            low_ratio = min_val / abs(med_other)
+        else:
+            low_ratio = np.inf
+
+        if np.isfinite(low_ratio) and low_ratio <= float(low_ratio_threshold):
+            current_vals = np.delete(current_vals, min_pos)
+            current_positions = np.delete(current_positions, min_pos)
+            removed_low_count += 1
+            continue
+
+        # Rule 3B: fallback. If directions are not strongly scattered by the
+        # global relative_spread criterion, keep all remaining values.
+        if _rel_spread(current_vals) <= float(spread_threshold):
+            if removed_low_count > 0:
+                return _use_current("rm_low_then_avg")
+            return _use_current("avg")
+
+        # Rule 3C: previous leave-one rel_dev fallback for extreme cases.
+        rel_dev = np.full(current_vals.shape, np.nan, dtype=float)
+        for i in range(current_vals.size):
+            others = np.delete(current_vals, i)
             med_other = float(np.nanmedian(others))
             if np.isfinite(med_other) and abs(med_other) >= 1e-12:
-                rel_dev[i] = abs(vals_valid[i] - med_other) / abs(med_other)
+                rel_dev[i] = abs(current_vals[i] - med_other) / abs(med_other)
 
         finite_dev = np.isfinite(rel_dev)
         if not np.any(finite_dev):
-            used_mask[finite] = True
-            return float(np.nanmean(vals_valid)), used_mask, "avg_nodev"
+            if removed_low_count > 0:
+                return _use_current("rm_low_then_avg_nodev")
+            return _use_current("avg_nodev")
 
         worst_pos = int(np.nanargmax(rel_dev))
         worst_dev = float(rel_dev[worst_pos])
 
-        # If no direction exceeds rel_dev_threshold, do not remove any direction.
         if worst_dev <= float(outlier_threshold):
-            used_mask[finite] = True
-            return float(np.nanmean(vals_valid)), used_mask, "avg_noout"
+            if removed_low_count > 0:
+                return _use_current("rm_low_then_avg_noout")
+            return _use_current("avg_noout")
 
-        worst_val = float(vals_valid[worst_pos])
-        min_val = float(np.nanmin(vals_valid))
-        max_val = float(np.nanmax(vals_valid))
+        worst_val = float(current_vals[worst_pos])
+        min_val = float(np.nanmin(current_vals))
+        max_val = float(np.nanmax(current_vals))
         tol = 1e-12
 
         if abs(worst_val - min_val) <= tol:
-            # User rule: if the outlier is the minimum, remove it.
-            keep_valid = np.ones(vals_valid.shape, dtype=bool)
-            keep_valid[worst_pos] = False
-            used_mask[valid_positions[keep_valid]] = True
-            vals2 = vals_valid[keep_valid]
-            if vals2.size == 0:
-                return np.nan, used_mask, "none"
-            return float(np.nanmean(vals2)), used_mask, "rm_min_avg"
+            current_vals = np.delete(current_vals, worst_pos)
+            current_positions = np.delete(current_positions, worst_pos)
+            removed_low_count += 1
+            continue
 
         if abs(worst_val - max_val) <= tol:
-            # User rule: if the outlier is the maximum, keep it and average all directions.
-            used_mask[finite] = True
-            return float(np.nanmean(vals_valid)), used_mask, "max_avg"
+            if removed_low_count > 0:
+                return _use_current("rm_low_then_max_avg")
+            return _use_current("max_avg")
 
-        # Rare fallback: the most outlying direction is neither the min nor the max.
-        # Keep all directions and use the average to avoid deleting an ambiguous middle value.
-        used_mask[finite] = True
-        return float(np.nanmean(vals_valid)), used_mask, "mid_avg"
-
-    used_mask[finite] = True
-    return float(np.nanmean(vals_valid)), used_mask, "avg"
-
+        if removed_low_count > 0:
+            return _use_current("rm_low_then_mid_avg")
+        return _use_current("mid_avg")
 
 def write_crater_summary_shp(direction_df: pd.DataFrame, out_shp: Path, cf_src):
     """
